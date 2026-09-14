@@ -1,6 +1,6 @@
 {
   "name": "pi-search-on-your-browser",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Search Google and read X (Twitter), Reddit, Amazon, and Google Scholar in your own visible Chrome \u2014 same approach as @antirez's ds4-agent. Zero dependencies, no API keys.",
   "type": "module",
   "scripts": {
