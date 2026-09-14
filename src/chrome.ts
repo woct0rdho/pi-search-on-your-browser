@@ -44,21 +44,59 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function findChrome(): string {
-  const paths = [
+/** Case-insensitive environment lookup joined with path segments.
+ *  Windows env var names are not consistently cased in `process.env`
+ *  ("ProgramFiles(x86)", "PROGRAMFILES", ...), so look the name up
+ *  case-insensitively rather than guessing the exact casing. */
+function envPath(name: string, ...segments: string[]): string | undefined {
+  const wanted = name.toLowerCase();
+  for (const key of Object.keys(process.env)) {
+    if (key.toLowerCase() !== wanted) continue;
+    const base = process.env[key];
+    if (base) return join(base, ...segments);
+  }
+  return undefined;
+}
+
+/** Candidate browser executables, most-preferred first. `CHROME_PATH` always
+ *  wins; then the platform's default install locations. Edge is last on
+ *  Windows — it is Chromium-based and accepts the same CDP flags, so it
+ *  works as a fallback when Google Chrome is not installed. */
+export function chromeCandidates(): string[] {
+  return [
     process.env.CHROME_PATH,
+    // Windows — Google Chrome (per-user then machine-wide installs)
+    envPath("LOCALAPPDATA", "Google", "Chrome", "Application", "chrome.exe"),
+    envPath("PROGRAMFILES", "Google", "Chrome", "Application", "chrome.exe"),
+    envPath("ProgramFiles(x86)", "Google", "Chrome", "Application", "chrome.exe"),
+    // Windows — Chromium
+    envPath("LOCALAPPDATA", "Chromium", "Application", "chrome.exe"),
+    envPath("PROGRAMFILES", "Chromium", "Application", "chrome.exe"),
+    // macOS
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    // Linux
     "/usr/bin/google-chrome-stable",
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/snap/bin/chromium",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-  ];
-  for (const p of paths) {
-    if (p && existsSync(p)) return p;
+    // Windows — Microsoft Edge (Chromium-based, same CDP flags)
+    envPath("PROGRAMFILES", "Microsoft", "Edge", "Application", "msedge.exe"),
+    envPath("ProgramFiles(x86)", "Microsoft", "Edge", "Application", "msedge.exe"),
+    envPath("LOCALAPPDATA", "Microsoft", "Edge", "Application", "msedge.exe"),
+  ].filter((p): p is string => Boolean(p));
+}
+
+/** First candidate that exists on disk, else a bare command name that spawn()
+ *  resolves through PATH (the binary may be installed somewhere non-standard
+ *  on Linux). launchChrome() turns a PATH-resolution failure into a readable
+ *  error instead of an uncaughtException. */
+export function findChrome(): string {
+  for (const p of chromeCandidates()) {
+    if (existsSync(p)) return p;
   }
-  return "google-chrome";
+  return process.platform === "win32" ? "chrome.exe" : "google-chrome";
 }
 
 // ── CDP over WebSocket ────────────────────────────────────────────────────
@@ -235,6 +273,16 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "about:blank",
 ];
 
+/** Actionable message for a spawn failure (ENOENT/EACCES): says which binary
+ *  was attempted and how to point the tool at the right one. */
+export function chromeSpawnErrorMessage(chromePath: string, err: Error): string {
+  return (
+    `Could not launch browser "${chromePath}": ${err.message}. ` +
+    `Install Google Chrome, or set CHROME_PATH to the browser executable ` +
+    `(e.g. CHROME_PATH="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe").`
+  );
+}
+
 async function launchChrome(): Promise<void> {
   mkdirSync(PROFILE_DIR, { recursive: true });
 
@@ -244,25 +292,40 @@ async function launchChrome(): Promise<void> {
 
   const args = CHROME_LAUNCH_ARGS;
 
-  chromeProcess = spawn(chromePath, args, {
+  const child = spawn(chromePath, args, {
     stdio: ["ignore", "ignore", "ignore"],
     detached: false,
   });
+  chromeProcess = child;
 
-  chromeProcess.on("exit", (code) => {
+  // spawn() failure (ENOENT/EACCES) arrives asynchronously as an 'error'
+  // event. With no listener attached, Node re-throws it as an
+  // uncaughtException — which kills the whole Pi process ("pi exiting due to
+  // uncaughtException: Error: spawn google-chrome ENOENT"). Capture it here
+  // and turn it into a normal rejected promise instead.
+  const spawnState: { error: Error | null } = { error: null };
+  child.on("error", (err) => {
+    spawnState.error = err;
+    chromeProcess = null;
+  });
+
+  child.on("exit", (code) => {
     console.error(`[pi-search] Chrome exited with code ${code}`);
     chromeProcess = null;
   });
 
   // Wait for CDP to become available
   for (let i = 0; i < 60; i++) {
+    if (spawnState.error) {
+      throw new Error(chromeSpawnErrorMessage(chromePath, spawnState.error));
+    }
     if (await isChromeAlive()) {
       console.error("[pi-search] Chrome is ready");
       return;
     }
     await sleep(500);
   }
-  throw new Error("Chrome did not become ready within 30s");
+  throw new Error(`Chrome did not become ready within 30s (launched from "${chromePath}")`);
 }
 
 async function ensureChrome(): Promise<void> {

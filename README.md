@@ -299,11 +299,11 @@ The test suite runs without a browser, without a network, and with **zero runtim
 npm test
 ```
 
-Four layers of tests (58 total):
+Four layers of tests (72 total):
 
 - **`tests/unit/urls.test.ts`** — table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - **`tests/unit/extractors-parse.test.ts`** — validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), and the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached).
+- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), and the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash.
 - **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve, reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
 
 ### Type-checking
@@ -330,6 +330,10 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 | Dependencies | Zero npm deps (just Node.js built-ins) | Zero deps (just POSIX) |
 
 ## Changelog
+
+### v0.8.1
+
+- **Fix: `google_search` crashed the whole Pi process with `spawn google-chrome ENOENT` on Windows.** `findChrome()` only knew Linux/macOS install paths, so on Windows it fell through to the bare name `google-chrome` — which does not exist — and the resulting `spawn` `error` event had no listener, so Node re-threw it as an `uncaughtException` and Pi exited. Browser discovery now probes the real Windows locations (`%LOCALAPPDATA%\Google\Chrome`, `%PROGRAMFILES%`, `%PROGRAMFILES(x86)%`, Chromium), prefers `CHROME_PATH`, falls back to Edge (Chromium-based, same CDP flags), and `launchChrome()` attaches an `error` listener that turns a failed launch into a normal, actionable tool error (`Could not launch browser "…": … set CHROME_PATH …`) instead of killing the session.
 
 ### v0.8.0
 

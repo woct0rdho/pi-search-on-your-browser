@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runInPageSession, CHROME_LAUNCH_ARGS, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
+import { runInPageSession, CHROME_LAUNCH_ARGS, chromeCandidates, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 
 // ── Fake CDP ───────────────────────────────────────────────────────────────
@@ -477,6 +477,89 @@ test("only the first Document response is captured (redirects use final status)"
   }));
 
   assert.equal(result, "extracted content", "non-Document 404s should not trigger the error path");
+});
+
+// ── Browser discovery (Windows support) ─────────────────────────────────
+// findChrome() used to only know Linux/macOS paths, so on Windows it fell
+// back to the bare name "google-chrome" → spawn ENOENT → uncaughtException
+// that killed the Pi process. These tests pin down the Windows candidates.
+
+test("chromeCandidates includes Windows Chrome install paths", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.LOCALAPPDATA = "C:\\Users\\tester\\AppData\\Local";
+    process.env.PROGRAMFILES = "C:\\Program Files";
+    process.env["ProgramFiles(x86)"] = "C:\\Program Files (x86)";
+    delete process.env.CHROME_PATH;
+
+    const candidates = chromeCandidates();
+    assert.ok(
+      candidates.some((p) => p.toLowerCase().endsWith("appdata\\local\\google\\chrome\\application\\chrome.exe")),
+      "should include the per-user Chrome install",
+    );
+    assert.ok(
+      candidates.includes("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"),
+      "should include the machine-wide Chrome install",
+    );
+    assert.ok(
+      candidates.includes("C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"),
+      "should include the 32-bit Chrome install",
+    );
+    assert.ok(
+      candidates.some((p) => p.toLowerCase().includes("msedge.exe")),
+      "should include Edge as a Chromium-based fallback",
+    );
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("chromeCandidates prefers CHROME_PATH and skips unset env vars", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.CHROME_PATH = "D:\\custom\\chrome.exe";
+    delete process.env.LOCALAPPDATA;
+    delete process.env.PROGRAMFILES;
+    delete process.env["ProgramFiles(x86)"];
+
+    const candidates = chromeCandidates();
+    assert.equal(candidates[0], "D:\\custom\\chrome.exe", "CHROME_PATH should come first");
+    assert.ok(
+      candidates.every((p) => !p.includes("undefined")),
+      "unset env vars should be filtered out, not produce \"undefined\\...\" paths",
+    );
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("findChrome returns CHROME_PATH when it exists", () => {
+  const saved = { ...process.env };
+  try {
+    // process.execPath always exists — good stand-in for a real binary.
+    process.env.CHROME_PATH = process.execPath;
+    assert.equal(findChrome(), process.execPath);
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("findChrome never returns an empty path", () => {
+  const saved = { ...process.env };
+  try {
+    delete process.env.CHROME_PATH;
+    const found = findChrome();
+    assert.ok(found.length > 0, "should fall back to a bare command name, never \"\"");
+  } finally {
+    process.env = saved;
+  }
+});
+
+test("chromeSpawnErrorMessage is actionable (never a bare ENOENT crash)", () => {
+  const err = Object.assign(new Error("spawn google-chrome ENOENT"), { code: "ENOENT" });
+  const msg = chromeSpawnErrorMessage("google-chrome", err);
+  assert.ok(msg.includes("google-chrome"), "should name the attempted binary");
+  assert.ok(msg.includes("CHROME_PATH"), "should tell the user about CHROME_PATH");
 });
 
 // ── Chrome launch flags (keep renderer alive in background) ───────────────
