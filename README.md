@@ -217,24 +217,28 @@ Status-specific hints:
 
 ## Commands
 
-- `/browse` — Configure the `visit_page` subagent (see below).
+- `/browse` — Configure the `visit_page` subagent and the Chrome proxy (see below).
 - `/google-search-kill` — Kill the Chrome browser.
 
-### Troubleshooting: Chrome must be relaunched after upgrading
+### Troubleshooting: Chrome launch flags are applied automatically
 
 `visit_page` drives a **visible Chrome** that `pi-search-on-your-browser`
-launches once and keeps alive across tool calls. If you upgrade the package
-(e.g. a new version adds or changes Chrome launch flags), the **already-
-running Chrome is reused as-is** — it was started with the *old* flags, so
-the new ones don't take effect until Chrome is relaunched.
+launches once and keeps alive across tool calls. The flags the live Chrome was
+started with are recorded in a marker file inside the dedicated profile
+(`~/.pi-search-browser/.pi-launch-args.json`), so when the effective flags
+change — after an upgrade, or after adding/removing/changing a proxy — the
+already-running Chrome is detected as stale and **restarted automatically** on
+the next tool call:
 
-Symptoms of a stale Chrome after an upgrade: `visit_page` hangs for ~30s on
-lazy-load pages (e.g. `github.com`) and fails with `CDP call timeout:
-Runtime.evaluate` when Chrome's window is in the background.
+```
+[pi-search] Chrome launch flags changed — restarting Chrome
+```
 
-Fix: run `/google-search-kill` (or `pkill -f remote-debugging-port=9322`)
-once after upgrading. The next `visit_page` call relaunches Chrome with the
-current flags. Restarting your Pi session also works.
+You can still force a restart yourself at any time with `/google-search-kill`
+(or `pkill -f remote-debugging-port=9322`); the next tool call relaunches
+Chrome. Symptoms of a stale Chrome: `visit_page` hangs for ~30s on lazy-load
+pages (e.g. `github.com`) and fails with `CDP call timeout: Runtime.evaluate`
+when Chrome's window is in the background.
 
 ### `/browse` — subagent configuration
 
@@ -279,6 +283,38 @@ startup; the config file wins over these once set):
 | `PI_BROWSE_MODEL` | — | pin a subagent model (else: current model) |
 | `PI_BROWSE_MAX_TOKENS` | `2048` | max output tokens for the summary |
 | `PI_BROWSE_REASONING_EFFORT` | `off` | thinking level for reasoning models |
+| `PI_SEARCH_PROXY` | — | proxy for the Chrome browser (see below) |
+
+### Proxy — browsing through a proxy
+
+On machines that need a proxy to reach the internet, `google_search` and
+`visit_page` would otherwise hang on pages that never load. Chrome is launched
+with `--proxy-server=<value>`, which covers every request it makes — including
+the CDP-driven navigations — so the whole tool keeps working. You do *not* need
+`HTTP(S)_PROXY` for Pi itself.
+
+```jsonc
+// ~/.pi/agent/pi-search-on-your-browser.json
+{
+  "browser": {
+    "proxy": "http://127.0.0.1:8010"
+  }
+}
+```
+
+Accepted forms: a full URL (`http://`, `https://`, `socks4://`, `socks5://`),
+credentials (`http://user:pass@proxy:3128`), or a bare `host:port` (the scheme
+defaults to `http://`). Localhost is never proxied. Set it interactively, or
+with the `PI_SEARCH_PROXY` environment variable (the config file wins once set):
+
+```
+/browse proxy http://127.0.0.1:8010   # or: /browse config proxy ...
+/browse proxy off                     # connect directly again
+/browse                               # shows the effective proxy
+```
+
+Changing the proxy takes effect on the next tool call: the running Chrome is
+restarted with the new flag (no Pi restart, no manual `/google-search-kill`).
 
 ## Requirements
 
@@ -299,12 +335,12 @@ The test suite runs without a browser, without a network, and with **zero runtim
 npm test
 ```
 
-Four layers of tests (72 total):
+Four layers of tests (83 total):
 
 - **`tests/unit/urls.test.ts`** — table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - **`tests/unit/extractors-parse.test.ts`** — validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), and the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash.
-- **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve, reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
+- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, and the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash.
+- **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve, reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. Also covers the browser proxy config: value normalization (`host:port` → `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
 
 ### Type-checking
 
@@ -334,6 +370,8 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 ### v0.8.1
 
 - **Fix: `google_search` crashed the whole Pi process with `spawn google-chrome ENOENT` on Windows.** `findChrome()` only knew Linux/macOS install paths, so on Windows it fell through to the bare name `google-chrome` — which does not exist — and the resulting `spawn` `error` event had no listener, so Node re-threw it as an `uncaughtException` and Pi exited. Browser discovery now probes the real Windows locations (`%LOCALAPPDATA%\Google\Chrome`, `%PROGRAMFILES%`, `%PROGRAMFILES(x86)%`, Chromium), prefers `CHROME_PATH`, falls back to Edge (Chromium-based, same CDP flags), and `launchChrome()` attaches an `error` listener that turns a failed launch into a normal, actionable tool error (`Could not launch browser "…": … set CHROME_PATH …`) instead of killing the session.
+- **New: proxy support for the Chrome browser.** Set `browser.proxy` in `~/.pi/agent/pi-search-on-your-browser.json` (or `PI_SEARCH_PROXY`, or `/browse proxy <url|off>`) and Chrome is launched with `--proxy-server=<value>` — every request it makes, including CDP-driven navigations, goes through the proxy, so `google_search`/`visit_page` work on machines without a direct route to the internet. Accepts `http://`, `https://`, `socks4://`, `socks5://` URLs (with or without credentials) and bare `host:port` (defaults to `http://`); empty/`off`/`none`/`direct` means a direct connection. `/browse` now reports the effective proxy. Verified end-to-end: Google search + `visit_page` through `http://127.0.0.1:8010`, plus an automatic Chrome restart when the proxy is changed.
+- **Chrome launch flags are now auto-detected instead of requiring a manual relaunch after upgrading.** The flags the live Chrome was started with are recorded in `~/.pi-search-browser/.pi-launch-args.json`; on the next tool call a mismatch (an upgrade that changed the flags, or a proxy added/removed/changed) is detected and the tool's Chrome restarted automatically. `shutdownChrome()` now also closes a Chrome started by an earlier Pi session (CDP `Browser.close`), not just its own child process. 12 new tests (83 total) cover browser discovery, the proxy launch flag, config precedence (file > env > direct), tolerant parsing, the saved config shape, the `/browse` summary line, and the actionability of the spawn-error message.
 
 ### v0.8.0
 
