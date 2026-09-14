@@ -46,6 +46,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Progress callback for the tool UI (Rendered inside the tool call block by
+ *  `onUpdate`, so it never disturbs the input line). */
+type StatusFn = (msg: string) => void;
+
+/**
+ * Diagnostics go to stderr only when PI_SEARCH_DEBUG is set. Pi's TUI runs in
+ * raw mode and prints raw stderr writes on the input bar, so anything logged
+ * unconditionally shows up as `[pi-search] ...` noise while typing. Messages
+ * the user should actually see go through the tool's status callback instead
+ * (see StatusFn); everything else is available with PI_SEARCH_DEBUG=1.
+ */
+function debugLog(message: string): void {
+  if (process.env.PI_SEARCH_DEBUG) console.error(`[pi-search] ${message}`);
+}
+
 /** Case-insensitive environment lookup joined with path segments.
  *  Windows env var names are not consistently cased in `process.env`
  *  ("ProgramFiles(x86)", "PROGRAMFILES", ...), so look the name up
@@ -353,14 +368,16 @@ export function chromeSpawnErrorMessage(chromePath: string, err: Error): string 
   );
 }
 
-async function launchChrome(args: readonly string[]): Promise<void> {
+async function launchChrome(args: readonly string[], status: StatusFn): Promise<void> {
   mkdirSync(PROFILE_DIR, { recursive: true });
 
   const chromePath = findChrome();
 
-  console.error(`[pi-search] Launching visible Chrome at ${chromePath}`);
+  debugLog(`Launching visible Chrome at ${chromePath}`);
   const proxyFlag = args.find((a) => a.startsWith("--proxy-server="));
-  if (proxyFlag) console.error(`[pi-search] ${proxyFlag}`);
+  if (proxyFlag) debugLog(proxyFlag);
+
+  status("Launching Chrome...");
 
   const child = spawn(chromePath, [...args], {
     stdio: ["ignore", "ignore", "ignore"],
@@ -380,7 +397,7 @@ async function launchChrome(args: readonly string[]): Promise<void> {
   });
 
   child.on("exit", (code) => {
-    console.error(`[pi-search] Chrome exited with code ${code}`);
+    debugLog(`Chrome exited with code ${code}`);
     chromeProcess = null;
     launchedArgs = null;
   });
@@ -393,7 +410,7 @@ async function launchChrome(args: readonly string[]): Promise<void> {
     if (await isChromeAlive()) {
       launchedArgs = [...args];
       canPersistLaunchArgs = writeLaunchMarker(args);
-      console.error("[pi-search] Chrome is ready");
+      debugLog("Chrome is ready");
       return;
     }
     await sleep(500);
@@ -401,7 +418,7 @@ async function launchChrome(args: readonly string[]): Promise<void> {
   throw new Error(`Chrome did not become ready within 30s (launched from "${chromePath}")`);
 }
 
-async function ensureChrome(): Promise<void> {
+async function ensureChrome(status: StatusFn): Promise<void> {
   const desired = chromeLaunchArgs();
 
   if (await isChromeAlive()) {
@@ -416,11 +433,12 @@ async function ensureChrome(): Promise<void> {
     // restart on every single call, so leave it alone instead.
     if (current === null && !canPersistLaunchArgs) return;
 
-    console.error(
+    debugLog(
       current
-        ? "[pi-search] Chrome launch flags changed — restarting Chrome"
-        : "[pi-search] Restarting Chrome to align its launch flags"
+        ? "Chrome launch flags changed — restarting Chrome"
+        : "Restarting Chrome to align its launch flags"
     );
+    status(current ? "Restarting Chrome to apply updated launch flags..." : "Restarting Chrome...");
     await stopChrome();
   } else if (chromeProcess) {
     chromeProcess.kill();
@@ -428,7 +446,7 @@ async function ensureChrome(): Promise<void> {
     await sleep(500);
   }
 
-  await launchChrome(desired);
+  await launchChrome(desired, status);
 }
 
 /** Stop the running Chrome (ours: signal it; started by another Pi session:
@@ -453,7 +471,7 @@ async function stopChrome(): Promise<void> {
     if (!(await isChromeAlive())) return;
     await sleep(250);
   }
-  console.error("[pi-search] Chrome did not exit within 5s — continuing anyway");
+  debugLog("Chrome did not exit within 5s — continuing anyway");
 }
 
 // ── Page operations ──────────────────────────────────────────────────────
@@ -668,7 +686,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
 }
 
 async function runInPage(opts: RunInPageOptions): Promise<string> {
-  await ensureChrome();
+  await ensureChrome(opts.onStatus);
 
   const tab = await openTab();
 

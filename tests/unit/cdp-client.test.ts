@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { runInPageSession, CHROME_LAUNCH_ARGS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 
@@ -477,6 +478,36 @@ test("only the first Document response is captured (redirects use final status)"
   }));
 
   assert.equal(result, "extracted content", "non-Document 404s should not trigger the error path");
+});
+
+// ── No stderr noise in the TUI ────────────────────────────────────────────
+// Pi's TUI runs in raw mode and renders raw stderr writes on the text input
+// bar, so an unconditional console.error shows up as "[pi-search] ..." while
+// the user is typing. All diagnostics live behind PI_SEARCH_DEBUG (via the
+// debugLog helper); user-visible progress goes through the tool's onStatus
+// callback instead.
+
+test("chrome.ts writes to stderr only behind PI_SEARCH_DEBUG", () => {
+  const source = readFileSync(new URL("../../src/chrome.ts", import.meta.url), "utf8");
+  const calls = [...source.matchAll(/console\.(error|warn|log|info)\s*\(/g)];
+  assert.equal(
+    calls.length,
+    1,
+    `expected exactly one console write (the gated debugLog), found ${calls.length}`,
+  );
+
+  const fnStart = source.indexOf("function debugLog");
+  assert.ok(fnStart >= 0, "debugLog helper should exist");
+  const fnEnd = source.indexOf("\n}", fnStart);
+  const callIndex = calls[0].index ?? -1;
+  assert.ok(
+    callIndex > fnStart && callIndex < fnEnd,
+    "the only console write must live inside debugLog",
+  );
+  assert.ok(
+    source.slice(fnStart, fnEnd).includes("PI_SEARCH_DEBUG"),
+    "debugLog must be gated by PI_SEARCH_DEBUG",
+  );
 });
 
 // ── Chrome launch flags (keep renderer alive in background) ───────────────

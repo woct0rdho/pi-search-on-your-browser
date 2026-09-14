@@ -231,17 +231,28 @@ started with are recorded in a marker file inside the dedicated profile
 (`~/.pi-search-browser/.pi-launch-args.json`), so when the effective flags
 change — after an upgrade, or after adding/removing/changing a proxy — the
 already-running Chrome is detected as stale and **restarted automatically** on
-the next tool call:
-
-```
-[pi-search] Chrome launch flags changed — restarting Chrome
-```
+the next tool call ("Restarting Chrome to apply updated launch flags..."
+appears in the tool call block).
 
 You can still force a restart yourself at any time with `/google-search-kill`
 (or `pkill -f remote-debugging-port=9322`); the next tool call relaunches
 Chrome. Symptoms of a stale Chrome: `visit_page` hangs for ~30s on lazy-load
 pages (e.g. `github.com`) and fails with `CDP call timeout: Runtime.evaluate`
 when Chrome's window is in the background.
+
+### Diagnostics: quiet by default
+
+The extension writes **nothing to stderr** during normal operation. Pi's TUI
+runs in raw mode and renders raw stderr writes on the text input bar, so
+`[pi-search] ...` messages (Chrome launched/ready/exited, launch flags changed)
+would appear as noise while you are typing. Progress the user should see
+("Launching Chrome...", "Restarting Chrome...", "Navigating to ...") is
+reported through the tool's status callback and rendered inside the tool call
+block instead.
+
+Set `PI_SEARCH_DEBUG=1` to get the diagnostics back on stderr when
+troubleshooting (Chrome path, proxy flag, exit code, restart decisions). On
+Windows PowerShell: `$env:PI_SEARCH_DEBUG="1"; pi`.
 
 ### `/browse` — subagent configuration
 
@@ -339,11 +350,11 @@ The test suite runs without a browser, without a network, and with **zero runtim
 npm test
 ```
 
-Four layers of tests (83 total):
+Four layers of tests (84 total):
 
 - **`tests/unit/urls.test.ts`** — table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - **`tests/unit/extractors-parse.test.ts`** — validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, and the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash.
+- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise).
 - **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve, reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. Also covers the browser proxy config: value normalization (`host:port` → `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
 
 ### Type-checking
@@ -377,6 +388,7 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 - **New: proxy support for the Chrome browser.** Set `browser.proxy` in `~/.pi/agent/search-on-your-browser.json` (or `PI_SEARCH_PROXY`, or `/browse proxy <url|off>`) and Chrome is launched with `--proxy-server=<value>` — every request it makes, including CDP-driven navigations, goes through the proxy, so `google_search`/`visit_page` work on machines without a direct route to the internet. Accepts `http://`, `https://`, `socks4://`, `socks5://` URLs (with or without credentials) and bare `host:port` (defaults to `http://`); empty/`off`/`none`/`direct` means a direct connection. `/browse` now reports the effective proxy. Verified end-to-end: Google search + `visit_page` through `http://127.0.0.1:8010`, plus an automatic Chrome restart when the proxy is changed.
 - **Chrome launch flags are now auto-detected instead of requiring a manual relaunch after upgrading.** The flags the live Chrome was started with are recorded in `~/.pi-search-browser/.pi-launch-args.json`; on the next tool call a mismatch (an upgrade that changed the flags, or a proxy added/removed/changed) is detected and the tool's Chrome restarted automatically. `shutdownChrome()` now also closes a Chrome started by an earlier Pi session (CDP `Browser.close`), not just its own child process. 12 new tests (83 total) cover browser discovery, the proxy launch flag, config precedence (file > env > direct), tolerant parsing, the saved config shape, the `/browse` summary line, and the actionability of the spawn-error message.
 - **The `🌐` footer indicator no longer duplicates the model Pi already shows.** In the default (unpinned) configuration the subagent reuses the current session model, so the status line rendered the exact same `provider/model` as Pi's own footer — one line of pure noise. It now appears only when the subagent is pinned to a *different* model (`/browse provider` + `/browse model`), the one case Pi's footer can't tell you about; the transient spinner during a summary call is unchanged. The `/browse on` message and README were updated to match.
+- **Fix: extension diagnostics no longer leak onto the TUI input line.** `src/chrome.ts` wrote `[pi-search] ...` messages (Chrome launched/ready/exited, launch flags changed) straight to stderr with `console.error()`. Pi's TUI runs in raw mode and renders raw stderr writes on the text input bar, so they showed up as noise while typing. All diagnostics now go through a `debugLog()` helper that writes only when `PI_SEARCH_DEBUG` is set. Progress the user should actually see ("Launching Chrome...", "Restarting Chrome...") is reported through the tool's `onStatus` callback instead — rendered inside the tool call block, where it belongs. A new regression test asserts the only `console.*` call in `chrome.ts` is the gated one. Verified: a full `google_search` through Chrome emits **0 bytes** on stderr by default, while `PI_SEARCH_DEBUG=1` restores the diagnostics.
 
 ### v0.8.0
 
