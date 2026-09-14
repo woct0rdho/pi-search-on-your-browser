@@ -55,24 +55,25 @@ type ToolTheme = {
   dim: (text: string) => string;
 };
 
-/** Footer status indicator for the subagent.
- *  Shows the pinned provider/model when configured, otherwise the current
- *  session model (since summary mode reuses it by default). */
+/** Footer status indicator for the summary subagent.
+ *
+ *  Pi's own footer already shows the current session model, and by default the
+ *  subagent reuses that exact model — so repeating it here adds nothing but a
+ *  line of noise (it renders byte-for-byte the same `provider/model`). The
+ *  status line therefore only appears when the subagent is pinned to a
+ *  *different* model, which is the one thing Pi's footer cannot tell you.
+ *
+ *  The transient spinner shown while a summary call is in flight is set
+ *  separately (and reflects the model actually being called), so it is
+ *  unaffected by this. */
 function updateStatus(ctx: {
   ui: { setStatus: (id: string, text: string | undefined) => void };
-  model?: { provider: string; id: string } | undefined;
 }) {
-  if (!config.enabled) {
-    ctx.ui.setStatus("browse", undefined);
+  if (config.enabled && config.provider && config.model) {
+    ctx.ui.setStatus("browse", `🌐 ${config.provider}/${config.model}`);
     return;
   }
-  if (config.provider && config.model) {
-    ctx.ui.setStatus("browse", `🌐 ${config.provider}/${config.model}`);
-  } else if (ctx.model) {
-    ctx.ui.setStatus("browse", `🌐 ${ctx.model.provider}/${ctx.model.id}`);
-  } else {
-    ctx.ui.setStatus("browse", "🌐 (no model)");
-  }
+  ctx.ui.setStatus("browse", undefined);
 }
 
 export default function searchOnYourBrowser(pi: ExtensionAPI) {
@@ -148,7 +149,11 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         saveConfigFile();
         persistConfig();
         updateStatus(ctx);
-        ctx.ui.notify("Browse subagent enabled. The 🌐 indicator is now visible in the footer.", "info");
+        ctx.ui.notify(
+          "Browse subagent enabled. It reuses the current session model, so no footer indicator is shown; " +
+            "pin a different one with /browse provider + /browse model to see it in the footer.",
+          "info",
+        );
         return;
       }
 

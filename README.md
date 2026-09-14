@@ -139,8 +139,11 @@ visit_page({
 - The subagent **reuses your current Pi model by default** (no API keys to
   set up — Pi's already-configured auth is used). Pin a different model with
   `/browse` if you want a cheaper/faster one for summarization.
-- The footer shows a `🌐 model` indicator (the current or pinned model) and an
-  animated spinner while the subagent is summarizing.
+- The footer shows a `🌐 provider/model` indicator **only when the subagent is
+  pinned to a model different from your session model** (run `/browse` with no
+  arguments to see what it resolves to); an animated spinner appears while the
+  subagent is summarizing. Reusing the session model needs no indicator —
+  Pi's own footer already shows that model.
 - The collapsed tool result shows the context savings, e.g.
   `→ 92,340→1,187 chars · openai/gpt-4o-mini · 3.2s · react.dev`.
 
@@ -266,9 +269,10 @@ only if you want to pin a different (e.g. cheaper/faster) model:
 Shorthand: `/browse provider openai` and `/browse model gpt-4o-mini` work
 without the `config` prefix.
 
-When no provider/model is pinned, the footer shows `🌐 <current-model>`;
-when pinned, it shows `🌐 provider/model`. Run `/browse` with no arguments
-to see the resolved configuration.
+When the subagent is pinned to a different model, the footer shows
+`🌐 provider/model`; otherwise no indicator appears, because the session model
+it reuses is already in Pi's footer. Run `/browse` with no arguments to see
+the resolved configuration.
 
 Configuration is persisted to `~/.pi/agent/search-on-your-browser.json` and
 also recorded in the session file, so changes survive across sessions and are
@@ -372,6 +376,7 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 - **Fix: `google_search` crashed the whole Pi process with `spawn google-chrome ENOENT` on Windows.** `findChrome()` only knew Linux/macOS install paths, so on Windows it fell through to the bare name `google-chrome` — which does not exist — and the resulting `spawn` `error` event had no listener, so Node re-threw it as an `uncaughtException` and Pi exited. Browser discovery now probes the real Windows locations (`%LOCALAPPDATA%\Google\Chrome`, `%PROGRAMFILES%`, `%PROGRAMFILES(x86)%`, Chromium), prefers `CHROME_PATH`, falls back to Edge (Chromium-based, same CDP flags), and `launchChrome()` attaches an `error` listener that turns a failed launch into a normal, actionable tool error (`Could not launch browser "…": … set CHROME_PATH …`) instead of killing the session.
 - **New: proxy support for the Chrome browser.** Set `browser.proxy` in `~/.pi/agent/search-on-your-browser.json` (or `PI_SEARCH_PROXY`, or `/browse proxy <url|off>`) and Chrome is launched with `--proxy-server=<value>` — every request it makes, including CDP-driven navigations, goes through the proxy, so `google_search`/`visit_page` work on machines without a direct route to the internet. Accepts `http://`, `https://`, `socks4://`, `socks5://` URLs (with or without credentials) and bare `host:port` (defaults to `http://`); empty/`off`/`none`/`direct` means a direct connection. `/browse` now reports the effective proxy. Verified end-to-end: Google search + `visit_page` through `http://127.0.0.1:8010`, plus an automatic Chrome restart when the proxy is changed.
 - **Chrome launch flags are now auto-detected instead of requiring a manual relaunch after upgrading.** The flags the live Chrome was started with are recorded in `~/.pi-search-browser/.pi-launch-args.json`; on the next tool call a mismatch (an upgrade that changed the flags, or a proxy added/removed/changed) is detected and the tool's Chrome restarted automatically. `shutdownChrome()` now also closes a Chrome started by an earlier Pi session (CDP `Browser.close`), not just its own child process. 12 new tests (83 total) cover browser discovery, the proxy launch flag, config precedence (file > env > direct), tolerant parsing, the saved config shape, the `/browse` summary line, and the actionability of the spawn-error message.
+- **The `🌐` footer indicator no longer duplicates the model Pi already shows.** In the default (unpinned) configuration the subagent reuses the current session model, so the status line rendered the exact same `provider/model` as Pi's own footer — one line of pure noise. It now appears only when the subagent is pinned to a *different* model (`/browse provider` + `/browse model`), the one case Pi's footer can't tell you about; the transient spinner during a summary call is unchanged. The `/browse on` message and README were updated to match.
 
 ### v0.8.0
 
