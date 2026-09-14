@@ -43,6 +43,7 @@ import {
   setConfigDir,
   truncateForContext,
   callSubagentModel,
+  normalizeProxy,
   type SubagentConfig,
 } from "./src/subagent.js";
 
@@ -93,6 +94,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         if (data.maxTokens !== undefined) config.maxTokens = data.maxTokens;
         if (data.defaultReasoningEffort !== undefined) config.defaultReasoningEffort = data.defaultReasoningEffort;
         if (data.enabled !== undefined) config.enabled = data.enabled;
+        if (data.proxy !== undefined) config.proxy = data.proxy;
       }
     }
 
@@ -102,6 +104,31 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
   /** Persist current config into the session file (in addition to the file). */
   function persistConfig() {
     pi.appendEntry("browse-config", { ...config });
+  }
+
+  /** Apply a /browse proxy argument: a URL, or "off"/"none"/"direct" to
+   *  connect directly. Chrome picks the value up when it is (re)launched, so
+   *  the next tool call restarts it automatically when the value changed. */
+  function applyProxyArgument(value: string): { ok: boolean; message: string } {
+    const cleared = ["off", "none", "direct", "false", "0"].includes(value.toLowerCase());
+    const proxy = cleared ? "" : normalizeProxy(value);
+    if (proxy === undefined) {
+      return {
+        ok: false,
+        message:
+          `Invalid proxy: "${value}". Use a URL like http://127.0.0.1:8010 ` +
+          `(or socks5://host:port), or "off" to connect directly.`,
+      };
+    }
+    config.proxy = proxy;
+    saveConfigFile();
+    persistConfig();
+    return {
+      ok: true,
+      message: proxy
+        ? `Chrome proxy set to "${proxy}". Chrome restarts with the new proxy on the next google_search / visit_page call.`
+        : "Chrome proxy cleared — Chrome will connect directly on the next call.",
+    };
   }
 
   // ── /browse command ─────────────────────────────────────────────────────
@@ -149,6 +176,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         config.maxTokens = parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? "2048", 10);
         config.defaultReasoningEffort = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT) ?? "off";
         config.enabled = true;
+        config.proxy = normalizeProxy(process.env.PI_SEARCH_PROXY) ?? "";
         saveConfigFile();
         persistConfig();
         updateStatus(ctx);
@@ -230,8 +258,24 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
           return;
         }
 
+        if (setting === "proxy") {
+          if (!value) {
+            ctx.ui.notify(
+              `Current Chrome proxy: ${config.proxy || "(direct, no proxy)"}\n\n` +
+                `Set it with: /browse config proxy http://127.0.0.1:8010\n` +
+                `Clear it with: /browse config proxy off\n` +
+                `Also honored: the PI_SEARCH_PROXY environment variable.`,
+              "info",
+            );
+            return;
+          }
+          const applied = applyProxyArgument(value);
+          ctx.ui.notify(applied.message, applied.ok ? "info" : "error");
+          return;
+        }
+
         ctx.ui.notify(
-          `Unknown config setting: "${setting}". Use: provider, model, max-tokens, reasoning-effort`,
+          `Unknown config setting: "${setting}". Use: provider, model, max-tokens, reasoning-effort, proxy`,
           "error",
         );
         return;
@@ -261,6 +305,17 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         persistConfig();
         updateStatus(ctx);
         ctx.ui.notify(`Browse subagent model set to "${config.model}"`, "info");
+        return;
+      }
+
+      // Shorthand: /browse proxy <url|off>
+      if (subcommand === "proxy") {
+        if (!rest) {
+          ctx.ui.notify(`Current Chrome proxy: ${config.proxy || "(direct, no proxy)"}`, "info");
+          return;
+        }
+        const applied = applyProxyArgument(rest);
+        ctx.ui.notify(applied.message, applied.ok ? "info" : "error");
         return;
       }
 
@@ -714,8 +769,8 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
   pi.registerCommand("google-search-kill", {
     description: "Kill the Google Search Chrome browser process",
     handler: async (_args, ctx) => {
-      shutdownChrome();
-      ctx.ui.notify("Google Search Chrome killed.", "info");
+      await shutdownChrome();
+      ctx.ui.notify("Google Search Chrome killed. The next search relaunches it, applying any proxy change.", "info");
     },
   });
 }

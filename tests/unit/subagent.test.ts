@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   validateReasoningLevel,
   buildReasoningParams,
@@ -7,7 +10,12 @@ import {
   buildMessages,
   configSummary,
   config as __config,
+  normalizeProxy,
   reloadConfig,
+  resolveConfig,
+  saveConfigFile,
+  setConfigDir,
+  configPath,
   SUBAGENT_SYSTEM_PROMPT,
   type SubagentModel,
 } from "../../src/subagent.ts";
@@ -209,4 +217,130 @@ test("configSummary: shows (none) when no override and no current model", () => 
   reloadConfig();
   const summary = configSummary(undefined);
   assert.ok(summary.includes("(none"), "should indicate no model available");
+});
+
+// ── Chrome proxy configuration ────────────────────────────────────────────
+// The proxy is handed to Chrome as --proxy-server when the browser is
+// launched (see chrome.ts), so on machines that need a proxy to reach the
+// internet google_search / visit_page keep working. These tests pin down how
+// the value is read, validated, and written.
+
+test("normalizeProxy: accepts URLs and bare host:port", () => {
+  assert.equal(normalizeProxy("http://127.0.0.1:8010"), "http://127.0.0.1:8010");
+  assert.equal(normalizeProxy("  http://127.0.0.1:8010/  "), "http://127.0.0.1:8010",
+    "trailing slash and whitespace should be normalized away");
+  assert.equal(normalizeProxy("127.0.0.1:8010"), "http://127.0.0.1:8010",
+    "a bare host:port should default to http");
+  assert.equal(normalizeProxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080",
+    "socks proxies should pass through");
+  assert.equal(normalizeProxy("http://user:pass@proxy.internal:3128"), "http://user:pass@proxy.internal:3128",
+    "credentials should be preserved");
+});
+
+test("normalizeProxy: off switches and invalid values yield undefined", () => {
+  for (const v of ["", "  ", "off", "OFF", "none", "direct", "false", "0"]) {
+    assert.equal(normalizeProxy(v), undefined, `"${v}" should mean \"no proxy\"`);
+  }
+  for (const v of ["not a url", "http://", ":8080", undefined, 42, null]) {
+    assert.equal(normalizeProxy(v), undefined, `${JSON.stringify(v)} should be rejected`);
+  }
+});
+
+/** Run `fn` with the config file pointed at a throwaway agent dir. */
+function withTempConfigDir(fn: (dir: string) => void): void {
+  const originalDir = dirname(configPath());
+  const originalProxyEnv = process.env.PI_SEARCH_PROXY;
+  const dir = mkdtempSync(join(tmpdir(), "pi-search-cfg-"));
+  try {
+    setConfigDir(dir);
+    delete process.env.PI_SEARCH_PROXY;
+    fn(dir);
+  } finally {
+    setConfigDir(originalDir);
+    if (originalProxyEnv === undefined) delete process.env.PI_SEARCH_PROXY;
+    else process.env.PI_SEARCH_PROXY = originalProxyEnv;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("resolveConfig: reads browser.proxy from the config file", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(
+      join(dir, "search-on-your-browser.json"),
+      JSON.stringify({ enabled: true, browser: { proxy: "127.0.0.1:8010" } }),
+    );
+    assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
+  });
+});
+
+test("resolveConfig: accepts a top-level proxy and lets the file win over the env var", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(
+      join(dir, "search-on-your-browser.json"),
+      JSON.stringify({ proxy: "socks5://127.0.0.1:1080" }),
+    );
+    process.env.PI_SEARCH_PROXY = "http://env-proxy:3128";
+    assert.equal(resolveConfig().proxy, "socks5://127.0.0.1:1080",
+      "the config file should win (so /browse changes are sticky)");
+  });
+});
+
+test("resolveConfig: falls back to PI_SEARCH_PROXY, then direct", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ enabled: true }));
+    process.env.PI_SEARCH_PROXY = "http://127.0.0.1:8010";
+    assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
+
+    delete process.env.PI_SEARCH_PROXY;
+    assert.equal(resolveConfig().proxy, "", "no proxy anywhere means a direct connection");
+  });
+});
+
+test("resolveConfig: tolerates a malformed config file and an invalid proxy", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(join(dir, "search-on-your-browser.json"), "{ this is not json");
+    assert.equal(resolveConfig().proxy, "", "a malformed file behaves like a missing one");
+
+    writeFileSync(
+      join(dir, "search-on-your-browser.json"),
+      JSON.stringify({ browser: { proxy: 42 } }),
+    );
+    assert.equal(resolveConfig().proxy, "", "an invalid proxy falls back to direct");
+  });
+});
+
+test("saveConfigFile: persists the proxy under browser.proxy", () => {
+  withTempConfigDir((dir) => {
+    const savedProxy = __config.proxy;
+    const savedEnabled = __config.enabled;
+    try {
+      __config.proxy = "http://127.0.0.1:8010";
+      __config.enabled = true;
+      saveConfigFile();
+      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
+      assert.equal(raw.browser.proxy, "http://127.0.0.1:8010");
+      // Round-trip: what was written is what resolveConfig reads back.
+      assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
+    } finally {
+      __config.proxy = savedProxy;
+      __config.enabled = savedEnabled;
+    }
+  });
+});
+
+test("configSummary: shows the effective Chrome proxy", () => {
+  const saved = __config.proxy;
+  try {
+    __config.proxy = "http://127.0.0.1:8010";
+    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
+    const line = summary.split("\n").find((l) => l.includes("Chrome proxy:"));
+    assert.ok(line?.includes("http://127.0.0.1:8010"), `proxy line should show the value: ${line}`);
+
+    __config.proxy = "";
+    const direct = configSummary({ provider: "openai", id: "gpt-4o" });
+    const directLine = direct.split("\n").find((l) => l.includes("Chrome proxy:"));
+    assert.ok(directLine?.includes("direct"), `proxy line should say direct: ${directLine}`);
+  } finally {
+    __config.proxy = saved;
+  }
 });

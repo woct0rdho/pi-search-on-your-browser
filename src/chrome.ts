@@ -11,9 +11,11 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { resolveConfig } from "./subagent.ts";
 
 import {
   GOOGLE_CONSENT_JS,
@@ -222,6 +224,12 @@ class CDPClient implements CDPLike {
 // ── Chrome process management ─────────────────────────────────────────────
 
 let chromeProcess: ChildProcess | null = null;
+/** Args of the Chrome started by *this* process (null when the live Chrome was
+ *  started elsewhere — an earlier Pi session using the same profile). */
+let launchedArgs: string[] | null = null;
+/** False once writing the launch marker has failed; disables restart-on-stale
+ *  logic (no marker means we would restart Chrome on every call). */
+let canPersistLaunchArgs = true;
 
 async function isChromeAlive(): Promise<boolean> {
   try {
@@ -273,6 +281,68 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "about:blank",
 ];
 
+/**
+ * Full launch arguments: the base flags above plus anything the configuration
+ * demands (currently only the proxy). Exported so tests can assert the proxy
+ * flag without spawning a real Chrome.
+ *
+ * The proxy comes from `browser.proxy` in
+ * <agent-dir>/search-on-your-browser.json, or the PI_SEARCH_PROXY env var
+ * (e.g. "http://127.0.0.1:8010", "socks5://127.0.0.1:1080"). Chrome applies
+ * it to every request, including the CDP-driven navigations, so google_search
+ * and visit_page work behind a required proxy. The value is read fresh on each
+ * call so a config change is picked up without restarting Pi.
+ */
+export function chromeLaunchArgs(proxy: string = resolveConfig().proxy): string[] {
+  const args = [...CHROME_LAUNCH_ARGS];
+  if (proxy) {
+    // Must come before the trailing URL argument (Chrome treats the last
+    // non-flag argument as the URL to open).
+    args.splice(args.length - 1, 0, `--proxy-server=${proxy}`);
+  }
+  return args;
+}
+
+/**
+ * File inside the dedicated profile recording the flags the *currently
+ * running* Chrome was started with. The profile directory outlives a Pi
+ * session, so without this we cannot tell whether an already-open Chrome is
+ * stale (e.g. launched before a proxy was configured) — it would silently keep
+ * using the old flags. Read/written best-effort.
+ */
+const LAUNCH_MARKER_FILE = join(PROFILE_DIR, ".pi-launch-args.json");
+
+/** Launch args recorded for the running Chrome, or null if unknown. */
+export function readLaunchMarker(): string[] | null {
+  try {
+    if (!existsSync(LAUNCH_MARKER_FILE)) return null;
+    const raw = JSON.parse(readFileSync(LAUNCH_MARKER_FILE, "utf-8")) as { args?: unknown };
+    if (!Array.isArray(raw.args)) return null;
+    if (!raw.args.every((a) => typeof a === "string")) return null;
+    return raw.args as string[];
+  } catch {
+    return null;
+  }
+}
+
+/** Record the launch args. Returns false when the marker can't be written. */
+export function writeLaunchMarker(args: readonly string[]): boolean {
+  try {
+    mkdirSync(PROFILE_DIR, { recursive: true });
+    writeFileSync(LAUNCH_MARKER_FILE, JSON.stringify({ args }, null, 2) + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Same flags in any order (Chrome only cares about the set). */
+function sameArgs(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((arg) => set.has(arg));
+}
+
 /** Actionable message for a spawn failure (ENOENT/EACCES): says which binary
  *  was attempted and how to point the tool at the right one. */
 export function chromeSpawnErrorMessage(chromePath: string, err: Error): string {
@@ -283,16 +353,16 @@ export function chromeSpawnErrorMessage(chromePath: string, err: Error): string 
   );
 }
 
-async function launchChrome(): Promise<void> {
+async function launchChrome(args: readonly string[]): Promise<void> {
   mkdirSync(PROFILE_DIR, { recursive: true });
 
   const chromePath = findChrome();
 
   console.error(`[pi-search] Launching visible Chrome at ${chromePath}`);
+  const proxyFlag = args.find((a) => a.startsWith("--proxy-server="));
+  if (proxyFlag) console.error(`[pi-search] ${proxyFlag}`);
 
-  const args = CHROME_LAUNCH_ARGS;
-
-  const child = spawn(chromePath, args, {
+  const child = spawn(chromePath, [...args], {
     stdio: ["ignore", "ignore", "ignore"],
     detached: false,
   });
@@ -312,6 +382,7 @@ async function launchChrome(): Promise<void> {
   child.on("exit", (code) => {
     console.error(`[pi-search] Chrome exited with code ${code}`);
     chromeProcess = null;
+    launchedArgs = null;
   });
 
   // Wait for CDP to become available
@@ -320,6 +391,8 @@ async function launchChrome(): Promise<void> {
       throw new Error(chromeSpawnErrorMessage(chromePath, spawnState.error));
     }
     if (await isChromeAlive()) {
+      launchedArgs = [...args];
+      canPersistLaunchArgs = writeLaunchMarker(args);
       console.error("[pi-search] Chrome is ready");
       return;
     }
@@ -329,13 +402,58 @@ async function launchChrome(): Promise<void> {
 }
 
 async function ensureChrome(): Promise<void> {
-  if (await isChromeAlive()) return;
-  if (chromeProcess) {
+  const desired = chromeLaunchArgs();
+
+  if (await isChromeAlive()) {
+    // What were the running Chrome's flags? Our own record wins; otherwise the
+    // marker file left by the process that launched it.
+    const current = launchedArgs ?? readLaunchMarker();
+    if (current && sameArgs(current, desired)) return;
+
+    // Unknown flags (Chrome started by an older version, before the marker
+    // existed). Restart it once so the current flags — including a proxy — are
+    // actually applied and recorded; if the marker can't be written we'd
+    // restart on every single call, so leave it alone instead.
+    if (current === null && !canPersistLaunchArgs) return;
+
+    console.error(
+      current
+        ? "[pi-search] Chrome launch flags changed — restarting Chrome"
+        : "[pi-search] Restarting Chrome to align its launch flags"
+    );
+    await stopChrome();
+  } else if (chromeProcess) {
     chromeProcess.kill();
     chromeProcess = null;
     await sleep(500);
   }
-  await launchChrome();
+
+  await launchChrome(desired);
+}
+
+/** Stop the running Chrome (ours: signal it; started by another Pi session:
+ *  ask it to close over CDP) and wait for the debugging port to go away. */
+async function stopChrome(): Promise<void> {
+  if (chromeProcess) {
+    chromeProcess.kill();
+    chromeProcess = null;
+  } else {
+    try {
+      const browserCdp = new CDPClient();
+      await browserCdp.connect(await getBrowserWSUrl());
+      await browserCdp.call("Browser.close");
+      browserCdp.disconnect();
+    } catch {
+      // best effort — it may already be gone
+    }
+  }
+  launchedArgs = null;
+
+  for (let i = 0; i < 20; i++) {
+    if (!(await isChromeAlive())) return;
+    await sleep(250);
+  }
+  console.error("[pi-search] Chrome did not exit within 5s — continuing anyway");
 }
 
 // ── Page operations ──────────────────────────────────────────────────────
@@ -701,11 +819,8 @@ export async function visitPage(
     { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true });
 }
 
-export function shutdownChrome() {
-  if (chromeProcess) {
-    chromeProcess.kill();
-    chromeProcess = null;
-  }
+export async function shutdownChrome(): Promise<void> {
+  await stopChrome();
 }
 
 // Exported for testing — internal API, not part of the extension's tool surface

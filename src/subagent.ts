@@ -16,12 +16,16 @@
  * src/). The real `Model<Api>` from the registry is structurally compatible
  * with `SubagentModel` and is passed in from index.ts.
  *
- * Config is persisted to <agent-dir>/pi-search-on-your-browser.json (set via
+ * Config is persisted to <agent-dir>/search-on-your-browser.json (set via
  * setConfigDir(getAgentDir()) on session_start) and managed via /browse.
  *
  * Env-var fallbacks (optional overrides; else current model is used):
  * PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
  * PI_BROWSE_REASONING_EFFORT.
+ *
+ * The same file also configures the browser itself (proxy), written as
+ * `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
+ * it when the file does not set one.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -56,6 +60,11 @@ export interface SubagentConfig {
   maxTokens: number;
   defaultReasoningEffort: ReasoningLevel;
   enabled: boolean;
+  /** Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
+   *  string means a direct connection. Passed to Chrome at launch, so a
+   *  change takes effect on the next Chrome start (the next tool call
+   *  restarts Chrome automatically when the value differs). */
+  proxy: string;
 }
 
 const DEFAULT_MAX_TOKENS = parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? "2048", 10);
@@ -64,6 +73,7 @@ const DEFAULT_CONFIG: SubagentConfig = {
   maxTokens: DEFAULT_MAX_TOKENS,
   defaultReasoningEffort: "off",
   enabled: true,
+  proxy: "",
 };
 
 /** Live config singleton. Mutated in place by /browse and session_start. */
@@ -82,7 +92,7 @@ function defaultConfigDir(): string {
 }
 
 export function configPath(): string {
-  return join(configDir ?? defaultConfigDir(), "pi-search-on-your-browser.json");
+  return join(configDir ?? defaultConfigDir(), "search-on-your-browser.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +142,31 @@ function asBool(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
 
+/**
+ * Normalize a proxy value into what Chrome's `--proxy-server` expects.
+ *
+ * Accepts a full URL (`http://`, `https://`, `socks4://`, `socks5://`), a bare
+ * `host:port` (scheme defaults to `http://`), and normalizes a trailing slash
+ * away. Returns undefined for anything that is not a usable proxy — including
+ * the explicit off switch (`""`, `"off"`, `"none"`, `"direct"`) — so callers
+ * can fall through to the next config layer.
+ */
+export function normalizeProxy(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (["off", "none", "direct", "false", "0"].includes(raw.toLowerCase())) return undefined;
+  // Bare host:port has no scheme; default to HTTP like Chrome does.
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
+  try {
+    const url = new URL(withScheme);
+    if (!url.hostname) return undefined;
+    return url.href.replace(/\/$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
 export function validateReasoningLevel(value: string | undefined): ReasoningLevel | undefined {
   if (!value) return undefined;
   const normalized = value.toLowerCase();
@@ -158,12 +193,21 @@ export function loadConfigFile(): RawConfig | null {
   }
 }
 
-/** Save current config to the JSON file. */
+/** Save current config to the JSON file. Browser launch settings live under a
+ *  `browser` object so the file stays readable. */
 export function saveConfigFile(): void {
   try {
     const path = configPath();
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+    const out = {
+      provider: config.provider,
+      model: config.model,
+      maxTokens: config.maxTokens,
+      defaultReasoningEffort: config.defaultReasoningEffort,
+      enabled: config.enabled,
+      browser: { proxy: config.proxy },
+    };
+    writeFileSync(path, JSON.stringify(out, null, 2) + "\n");
   } catch {
     // best effort — directory not writable, etc.
   }
@@ -171,7 +215,7 @@ export function saveConfigFile(): void {
 
 /**
  * Resolve config with priority:
- *   1. Config file (<agent-dir>/pi-search-on-your-browser.json)
+ *   1. Config file (<agent-dir>/search-on-your-browser.json)
  *   2. Environment variables (PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, etc.)
  *   3. Built-in defaults
  *
@@ -182,6 +226,12 @@ export function resolveConfig(): SubagentConfig {
   const envReasoning = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT);
   const fileReasoning = validateReasoningLevel(asString(file?.defaultReasoningEffort));
   const fileEnabled = asBool(file?.enabled);
+  // Browser settings may live under `browser` (documented shape, what
+  // saveConfigFile writes) or at the top level (hand-written convenience).
+  const fileBrowser =
+    file && typeof file.browser === "object" && file.browser !== null
+      ? (file.browser as RawConfig)
+      : {};
   return {
     provider: asString(file?.provider) || process.env.PI_BROWSE_PROVIDER || undefined,
     model: asString(file?.model) || process.env.PI_BROWSE_MODEL || undefined,
@@ -191,6 +241,11 @@ export function resolveConfig(): SubagentConfig {
         : parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? String(DEFAULT_MAX_TOKENS), 10),
     defaultReasoningEffort: fileReasoning ?? envReasoning ?? "off",
     enabled: fileEnabled !== false,
+    proxy:
+      normalizeProxy(fileBrowser.proxy) ??
+      normalizeProxy(file?.proxy) ??
+      normalizeProxy(process.env.PI_SEARCH_PROXY) ??
+      "",
   };
 }
 
@@ -226,6 +281,7 @@ export function configSummary(
     `  Max tokens:        ${config.maxTokens}`,
     `  Reasoning effort:  ${config.defaultReasoningEffort}`,
     `  Enabled:           ${config.enabled ? "yes" : "no"}`,
+    `  Chrome proxy:      ${config.proxy || "(direct, no proxy)"}`,
     ``,
     `Config file: ${configPath()}`,
     ``,
@@ -236,7 +292,10 @@ export function configSummary(
     "By default the subagent reuses your current Pi model (shown above) with its",
     "already-configured auth — no API keys to set up. To pin a different model:",
     "  /browse provider <provider>   /browse model <model-id>",
-    "Other settings: max-tokens, reasoning-effort. Use /browse on|off to toggle.",
+    "Other settings: max-tokens, reasoning-effort, proxy. Use /browse on|off to toggle.",
+    "",
+    "The Chrome proxy is applied when Chrome is launched; changing it restarts the",
+    "tool's Chrome on the next google_search / visit_page call.",
   ].join("\n");
 }
 

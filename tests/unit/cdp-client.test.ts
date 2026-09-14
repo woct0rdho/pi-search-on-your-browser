@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runInPageSession, CHROME_LAUNCH_ARGS, chromeCandidates, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
+import { runInPageSession, CHROME_LAUNCH_ARGS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 
 // ── Fake CDP ───────────────────────────────────────────────────────────────
@@ -479,7 +479,23 @@ test("only the first Document response is captured (redirects use final status)"
   assert.equal(result, "extracted content", "non-Document 404s should not trigger the error path");
 });
 
-// ── Browser discovery (Windows support) ─────────────────────────────────
+// ── Chrome launch flags (keep renderer alive in background) ───────────────
+// These flags are the difference between visit_page working with Chrome in
+// the background (window behind the terminal) vs hanging for 30s. They are
+// asserted here so a future refactor doesn't silently drop one.
+
+test("CHROME_LAUNCH_ARGS keeps background-tab renderers alive", () => {
+  // Without these, Chrome suspends the renderer of non-active tabs, making
+  // window.scrollTo() a no-op for triggering lazy-loaded content.
+  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-background-timer-throttling"),
+    "should disable background timer throttling");
+  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-backgrounding-occluded-windows"),
+    "should disable backgrounding of occluded windows");
+  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-renderer-backgrounding"),
+    "should disable renderer backgrounding");
+});
+
+// ── Browser discovery (Windows support) ──────────────────────────────────
 // findChrome() used to only know Linux/macOS paths, so on Windows it fell
 // back to the bare name "google-chrome" → spawn ENOENT → uncaughtException
 // that killed the Pi process. These tests pin down the Windows candidates.
@@ -562,20 +578,30 @@ test("chromeSpawnErrorMessage is actionable (never a bare ENOENT crash)", () => 
   assert.ok(msg.includes("CHROME_PATH"), "should tell the user about CHROME_PATH");
 });
 
-// ── Chrome launch flags (keep renderer alive in background) ───────────────
-// These flags are the difference between visit_page working with Chrome in
-// the background (window behind the terminal) vs hanging for 30s. They are
-// asserted here so a future refactor doesn't silently drop one.
+// ── Proxy support ─────────────────────────────────────────────────────────
+// Chrome applies --proxy-server to every request, including CDP-driven
+// navigations, so this is how google_search / visit_page work on machines
+// that need a proxy to reach the internet.
 
-test("CHROME_LAUNCH_ARGS keeps background-tab renderers alive", () => {
-  // Without these, Chrome suspends the renderer of non-active tabs, making
-  // window.scrollTo() a no-op for triggering lazy-loaded content.
-  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-background-timer-throttling"),
-    "should disable background timer throttling");
-  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-backgrounding-occluded-windows"),
-    "should disable backgrounding of occluded windows");
-  assert.ok(CHROME_LAUNCH_ARGS.includes("--disable-renderer-backgrounding"),
-    "should disable renderer backgrounding");
+test("chromeLaunchArgs adds --proxy-server and keeps the URL last", () => {
+  const args = chromeLaunchArgs("http://127.0.0.1:8010");
+  assert.ok(args.includes("--proxy-server=http://127.0.0.1:8010"), "should pass the proxy flag");
+  assert.equal(args[args.length - 1], "about:blank", "the URL argument must stay last");
+  assert.ok(args.indexOf("--proxy-server=http://127.0.0.1:8010") < args.length - 1,
+    "the flag must precede the URL");
+});
+
+test("chromeLaunchArgs adds no proxy flag when the proxy is empty", () => {
+  const args = chromeLaunchArgs("");
+  assert.ok(!args.some((a) => a.startsWith("--proxy-server=")), "direct connection should pass no proxy flag");
+  assert.deepEqual(args, [...CHROME_LAUNCH_ARGS], "empty proxy = base flags only");
+});
+
+test("chromeLaunchArgs keeps every base flag", () => {
+  const args = chromeLaunchArgs("socks5://127.0.0.1:1080");
+  for (const base of CHROME_LAUNCH_ARGS) {
+    assert.ok(args.includes(base), `should keep base flag ${base}`);
+  }
 });
 
 test("CHROME_LAUNCH_ARGS disables native window-occlusion detection", () => {
