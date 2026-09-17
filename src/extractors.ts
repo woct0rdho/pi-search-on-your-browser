@@ -37,20 +37,26 @@ export const GOOGLE_CONSENT_JS =
   'return"";' +
   "})()";
 
+// Google search results. Classic redirect wrappers (`/url?q=` / `/url?url=`) are
+// unwrapped locally when the target is a plain URL. The newer
+// `/goto?url=<opaque token>` wrapper is a Tink-encrypted protobuf that cannot be
+// decoded offline, so those links are kept as-is and resolved afterwards in the
+// browser (HTTP 302 Location) by src/google-links.ts — never dropped.
 export const GOOGLE_SEARCH_JS =
   "(() => {" +
   'const clean=s=>(s||"").replace(/\\s+/g," ").trim();' +
   'const esc=s=>clean(s).replace(/\\\\/g,"\\\\\\\\").replace(/\\[/g,"\\\\[").replace(/\\]/g,"\\\\]").replace(/\\n/g," ");' +
   'const visible=el=>{const r=el.getBoundingClientRect();const st=getComputedStyle(el);return r.width>0&&r.height>0&&st.display!=="none"&&st.visibility!=="hidden"&&st.opacity!=="0";};' +
   "const bad=h=>/(^|\\.)google\\./.test(h)||/(^|\\.)gstatic\\./.test(h)||/(^|\\.)googleusercontent\\./.test(h);" +
+  "const wrap=u=>/(^|\\.)google\\./.test(u.hostname)&&/^\\/(url|goto)\\/?$/.test(u.pathname);" +
   'const lines=["# Google search results","","URL: "+location.href,"","## Visible links"];' +
   "const seen=new Set();" +
   'for(const a of document.querySelectorAll("a[href]")){' +
   "if(!visible(a))continue;let href=a.href||'';" +
-  'try{const u=new URL(href);if(u.pathname==="/url"&&u.searchParams.get("q"))href=u.searchParams.get("q");}catch{}' +
+  'try{const u=new URL(href);if(wrap(u)){const t=u.searchParams.get("q")||u.searchParams.get("url");if(t&&/^https?:\\/\\//i.test(t))href=t;}}catch{}' +
   "let u;try{u=new URL(href)}catch{continue;}" +
   "if(!/^https?:$/.test(u.protocol))continue;" +
-  "if(bad(u.hostname))continue;" +
+  "if(bad(u.hostname)&&!wrap(u))continue;" +
   "const text=esc(a.innerText||a.textContent);if(text.length<3)continue;" +
   "if(seen.has(u.href))continue;seen.add(u.href);" +
   'lines.push("- ["+text.slice(0,180)+"]("+u.href+")");if(seen.size>=30)break;}' +

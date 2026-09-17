@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { resolveConfig } from "./subagent.ts";
+import { resolveGoogleRedirectsInBrowser } from "./google-links.ts";
 
 import {
   GOOGLE_CONSENT_JS,
@@ -538,6 +539,11 @@ interface RunInPageOptions {
    *  Default false so non-scrolling pages (Google search, Scholar, Defuddle)
    *  don't steal focus. */
   bringToFront?: boolean;
+  /** When true, resolve Google `/goto` redirect links in the open tab before
+   *  returning the markdown (see src/google-links.ts). Used by googleSearch;
+   *  requires the CDP client to receive `Network.responseReceived` events
+   *  (Network.enable is already called by this session). */
+  resolveGoogleRedirects?: boolean;
   onStatus: (msg: string) => void;
 }
 
@@ -556,6 +562,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     waitForSelector,
     waitForTimeoutMs = 8000,
     waitForSelectorPollMs = 400,
+    resolveGoogleRedirects = false,
     onStatus,
   } = opts;
 
@@ -678,6 +685,14 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     result = await cdp.evaluate(opts.fallbackJs);
   }
 
+  // Google search results may contain `/goto?url=<opaque>` redirect wrappers
+  // that JavaScript cannot decode or follow. Ask Google for the destination
+  // (302 Location) from inside this tab — it has the session, cookies and
+  // proxy of the search — and swap the direct URLs into the markdown.
+  if (opts.resolveGoogleRedirects) {
+    result = await resolveGoogleRedirectsInBrowser(cdp, result, { onStatus });
+  }
+
   // Truncate
   if (result.length > MAX_RESULT_BYTES) {
     return result.slice(0, MAX_RESULT_BYTES) + "\n\n[Content truncated at 1MB]";
@@ -745,6 +760,9 @@ async function extractVia(
     initialWaitMs?: number;
     fallbackJs?: string;
     bringToFront?: boolean;
+    /** Resolve Google `/goto` redirect links in the open tab before returning
+     *  (see src/google-links.ts). Used by googleSearch. */
+    resolveGoogleRedirects?: boolean;
   } = {},
 ): Promise<SearchResult> {
   if (msg) status(msg);
@@ -758,6 +776,7 @@ async function extractVia(
     waitForTimeoutMs: opts.waitForTimeoutMs ?? 10_000,
     fallbackJs: opts.fallbackJs,
     bringToFront: opts.bringToFront ?? false,
+    resolveGoogleRedirects: opts.resolveGoogleRedirects ?? false,
     onStatus: status,
   });
   return resolveHttpError(markdown, url);
@@ -771,7 +790,7 @@ export async function googleSearch(
   const encodedQuery = encodeURIComponent(query);
   const url = `https://www.google.com/search?q=${encodedQuery}`;
   return extractVia(url, status, `Searching Google for: ${query}`,
-    GOOGLE_SEARCH_JS, { clickConsent: true, initialWaitMs: 0 });
+    GOOGLE_SEARCH_JS, { clickConsent: true, initialWaitMs: 0, resolveGoogleRedirects: true });
 }
 
 // If the extraction returned an HTTP-error marker (set by runInPageSession
