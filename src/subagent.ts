@@ -21,7 +21,10 @@
  *
  * Env-var fallbacks (optional overrides; else current model is used):
  * PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
- * PI_BROWSE_REASONING_EFFORT.
+ * PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED.
+ *
+ * `summaryEnabled` selects whether `visit_page` offers its `summary` option at
+ * all (it does not disable the tool itself).
  *
  * The same file also configures the browser itself (proxy), written as
  * `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
@@ -59,7 +62,12 @@ export interface SubagentConfig {
   model?: string;
   maxTokens: number;
   defaultReasoningEffort: ReasoningLevel;
-  enabled: boolean;
+  /** Whether `visit_page` offers `summary` mode. When false the option is
+   *  hidden from the model completely — no `summary` parameter and no mention
+   *  of it in the tool description, snippet, or guidelines — and pages are
+   *  returned as raw markdown. It does not disable the tool itself. Toggled
+   *  with /browse on|off. */
+  summaryEnabled: boolean;
   /** Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
    *  string means a direct connection. Passed to Chrome at launch, so a
    *  change takes effect on the next Chrome start (the next tool call
@@ -72,7 +80,7 @@ const DEFAULT_MAX_TOKENS = parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? "2048", 
 const DEFAULT_CONFIG: SubagentConfig = {
   maxTokens: DEFAULT_MAX_TOKENS,
   defaultReasoningEffort: "off",
-  enabled: true,
+  summaryEnabled: true,
   proxy: "",
 };
 
@@ -142,6 +150,15 @@ function asBool(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
 
+/** Parse a boolean env var: 1/true/yes/on → true, 0/false/no/off → false. */
+function asEnvBool(v: string | undefined): boolean | undefined {
+  if (v === undefined) return undefined;
+  const s = v.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(s)) return true;
+  if (["0", "false", "no", "off"].includes(s)) return false;
+  return undefined;
+}
+
 /**
  * Normalize a proxy value into what Chrome's `--proxy-server` expects.
  *
@@ -204,7 +221,7 @@ export function saveConfigFile(): void {
       model: config.model,
       maxTokens: config.maxTokens,
       defaultReasoningEffort: config.defaultReasoningEffort,
-      enabled: config.enabled,
+      summaryEnabled: config.summaryEnabled,
       browser: { proxy: config.proxy },
     };
     writeFileSync(path, JSON.stringify(out, null, 2) + "\n");
@@ -225,7 +242,8 @@ export function resolveConfig(): SubagentConfig {
   const file = loadConfigFile();
   const envReasoning = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT);
   const fileReasoning = validateReasoningLevel(asString(file?.defaultReasoningEffort));
-  const fileEnabled = asBool(file?.enabled);
+  const fileSummaryEnabled = asBool(file?.summaryEnabled);
+  const envSummaryEnabled = asEnvBool(process.env.PI_BROWSE_SUMMARY_ENABLED);
   // Browser settings may live under `browser` (documented shape, what
   // saveConfigFile writes) or at the top level (hand-written convenience).
   const fileBrowser =
@@ -240,7 +258,7 @@ export function resolveConfig(): SubagentConfig {
         ? asNumber(file.maxTokens, DEFAULT_CONFIG.maxTokens)
         : parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? String(DEFAULT_MAX_TOKENS), 10),
     defaultReasoningEffort: fileReasoning ?? envReasoning ?? "off",
-    enabled: fileEnabled !== false,
+    summaryEnabled: fileSummaryEnabled ?? envSummaryEnabled ?? true,
     proxy:
       normalizeProxy(fileBrowser.proxy) ??
       normalizeProxy(file?.proxy) ??
@@ -280,14 +298,22 @@ export function configSummary(
     `  Model:             ${modelLine}`,
     `  Max tokens:        ${config.maxTokens}`,
     `  Reasoning effort:  ${config.defaultReasoningEffort}`,
-    `  Enabled:           ${config.enabled ? "yes" : "no"}`,
+    `  Summary mode:      ${config.summaryEnabled ? "enabled (visit_page offers `summary: true`)" : "disabled (visit_page returns raw pages, no summary option shown)"}`,
     `  Chrome proxy:      ${config.proxy || "(direct, no proxy)"}`,
     ``,
     `Config file: ${configPath()}`,
     ``,
-    "When visit_page is called with `summary: true`, the page content is sent to this",
-    "model and only its concise summary is returned to the chat context (the full",
-    "page markdown is discarded). Without `summary`, visit_page returns the raw page.",
+    ...(config.summaryEnabled
+      ? [
+          "When visit_page is called with `summary: true`, the page content is sent to this",
+          "model and only its concise summary is returned to the chat context (the full",
+          "page markdown is discarded). Without `summary`, visit_page returns the raw page.",
+        ]
+      : [
+          "Summary mode is disabled: visit_page does not offer `summary` at all — the option",
+          "is hidden from the model and pages are always returned as raw markdown. The model",
+          "settings above are kept for when you re-enable it with /browse on.",
+        ]),
     ``,
     "By default the subagent reuses your current Pi model (shown above) with its",
     "already-configured auth — no API keys to set up. To pin a different model:",

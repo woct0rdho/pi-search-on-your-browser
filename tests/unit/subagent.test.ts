@@ -250,15 +250,19 @@ test("normalizeProxy: off switches and invalid values yield undefined", () => {
 function withTempConfigDir(fn: (dir: string) => void): void {
   const originalDir = dirname(configPath());
   const originalProxyEnv = process.env.PI_SEARCH_PROXY;
+  const originalSummaryEnv = process.env.PI_BROWSE_SUMMARY_ENABLED;
   const dir = mkdtempSync(join(tmpdir(), "pi-search-cfg-"));
   try {
     setConfigDir(dir);
     delete process.env.PI_SEARCH_PROXY;
+    delete process.env.PI_BROWSE_SUMMARY_ENABLED;
     fn(dir);
   } finally {
     setConfigDir(originalDir);
     if (originalProxyEnv === undefined) delete process.env.PI_SEARCH_PROXY;
     else process.env.PI_SEARCH_PROXY = originalProxyEnv;
+    if (originalSummaryEnv === undefined) delete process.env.PI_BROWSE_SUMMARY_ENABLED;
+    else process.env.PI_BROWSE_SUMMARY_ENABLED = originalSummaryEnv;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -267,7 +271,7 @@ test("resolveConfig: reads browser.proxy from the config file", () => {
   withTempConfigDir((dir) => {
     writeFileSync(
       join(dir, "search-on-your-browser.json"),
-      JSON.stringify({ enabled: true, browser: { proxy: "127.0.0.1:8010" } }),
+      JSON.stringify({ summaryEnabled: true, browser: { proxy: "127.0.0.1:8010" } }),
     );
     assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
   });
@@ -287,7 +291,7 @@ test("resolveConfig: accepts a top-level proxy and lets the file win over the en
 
 test("resolveConfig: falls back to PI_SEARCH_PROXY, then direct", () => {
   withTempConfigDir((dir) => {
-    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ enabled: true }));
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ summaryEnabled: true }));
     process.env.PI_SEARCH_PROXY = "http://127.0.0.1:8010";
     assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
 
@@ -312,10 +316,10 @@ test("resolveConfig: tolerates a malformed config file and an invalid proxy", ()
 test("saveConfigFile: persists the proxy under browser.proxy", () => {
   withTempConfigDir((dir) => {
     const savedProxy = __config.proxy;
-    const savedEnabled = __config.enabled;
+    const savedSummary = __config.summaryEnabled;
     try {
       __config.proxy = "http://127.0.0.1:8010";
-      __config.enabled = true;
+      __config.summaryEnabled = true;
       saveConfigFile();
       const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
       assert.equal(raw.browser.proxy, "http://127.0.0.1:8010");
@@ -323,7 +327,7 @@ test("saveConfigFile: persists the proxy under browser.proxy", () => {
       assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
     } finally {
       __config.proxy = savedProxy;
-      __config.enabled = savedEnabled;
+      __config.summaryEnabled = savedSummary;
     }
   });
 });
@@ -342,5 +346,91 @@ test("configSummary: shows the effective Chrome proxy", () => {
     assert.ok(directLine?.includes("direct"), `proxy line should say direct: ${directLine}`);
   } finally {
     __config.proxy = saved;
+  }
+});
+
+// ── summary-mode configuration (`summaryEnabled`) ─────────────────────────
+// `summaryEnabled: false` does not disable visit_page — ``url``/``clean`` keep
+// working — it is what makes index.ts hide the `summary` option from the model
+// entirely (no parameter, no description/guideline mention). These tests pin
+// down how the flag is read and what /browse reports.
+
+test("resolveConfig: summary mode defaults to enabled", () => {
+  withTempConfigDir(() => {
+    assert.equal(resolveConfig().summaryEnabled, true);
+  });
+});
+
+test("resolveConfig: reads summaryEnabled from the config file", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ summaryEnabled: false }));
+    assert.equal(resolveConfig().summaryEnabled, false);
+  });
+});
+
+test("resolveConfig: PI_BROWSE_SUMMARY_ENABLED can disable summary mode", () => {
+  withTempConfigDir(() => {
+    for (const truthy of ["1", "true", "yes", "on", "TRUE"]) {
+      process.env.PI_BROWSE_SUMMARY_ENABLED = truthy;
+      assert.equal(resolveConfig().summaryEnabled, true, `"${truthy}" should enable`);
+    }
+    for (const falsy of ["0", "false", "no", "off", "FALSE"]) {
+      process.env.PI_BROWSE_SUMMARY_ENABLED = falsy;
+      assert.equal(resolveConfig().summaryEnabled, false, `"${falsy}" should disable`);
+    }
+    process.env.PI_BROWSE_SUMMARY_ENABLED = "maybe";
+    assert.equal(resolveConfig().summaryEnabled, true, "unparseable values fall back to the default");
+  });
+});
+
+test("resolveConfig: the config file wins over PI_BROWSE_SUMMARY_ENABLED", () => {
+  withTempConfigDir((dir) => {
+    process.env.PI_BROWSE_SUMMARY_ENABLED = "0";
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ summaryEnabled: true }));
+    assert.equal(resolveConfig().summaryEnabled, true, "the file should win over the env var");
+
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ summaryEnabled: false }));
+    process.env.PI_BROWSE_SUMMARY_ENABLED = "1";
+    assert.equal(resolveConfig().summaryEnabled, false, "the file should win over the env var");
+  });
+});
+
+test("saveConfigFile: round-trips summaryEnabled = false", () => {
+  withTempConfigDir((dir) => {
+    const saved = __config.summaryEnabled;
+    try {
+      __config.summaryEnabled = false;
+      saveConfigFile();
+      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
+      assert.equal(raw.summaryEnabled, false);
+      assert.equal(resolveConfig().summaryEnabled, false);
+    } finally {
+      __config.summaryEnabled = saved;
+    }
+  });
+});
+
+test("configSummary: reports summary mode as enabled by default", () => {
+  const saved = __config.summaryEnabled;
+  try {
+    __config.summaryEnabled = true;
+    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
+    const line = summary.split("\n").find((l) => l.includes("Summary mode:"));
+    assert.ok(line?.includes("enabled"), `summary-mode line should say enabled: ${line}`);
+  } finally {
+    __config.summaryEnabled = saved;
+  }
+});
+
+test("configSummary: reports the hidden summary option when disabled", () => {
+  const saved = __config.summaryEnabled;
+  try {
+    __config.summaryEnabled = false;
+    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
+    const line = summary.split("\n").find((l) => l.includes("Summary mode:"));
+    assert.ok(line?.includes("disabled"), `summary-mode line should say disabled: ${line}`);
+    assert.ok(/hidden from the model/i.test(summary), "should explain that the option is hidden");
+  } finally {
+    __config.summaryEnabled = saved;
   }
 });
