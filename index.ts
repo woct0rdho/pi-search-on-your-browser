@@ -25,8 +25,14 @@
  *                       file, `PI_BROWSE_SUMMARY_ENABLED=0`, or `/browse off` — the `summary`
  *                       parameter is removed from the tool schema and the description, prompt
  *                       snippet, and guidelines are swapped for variants that never mention it,
- *                       so the model is not told the option exists. (`url`/`clean` and
- *                       google_search keep working; the flag only gates summary mode.)
+ *                       so the model is not told the option exists.
+ *
+ *                       `clean` is gated independently by `cleanEnabled`: `"cleanEnabled": false`
+ *                       in the config file, `PI_BROWSE_CLEAN_ENABLED=0`, or `/browse clean off`
+ *                       removes the `clean` parameter and every mention of it, including the
+ *                       "Combine with `clean: true`" sentence in the summary parameter
+ *                       description. Disabling one feature never affects the other, or the rest
+ *                       of the tool (`url` and google_search always work).
  *
  * Registered commands:
  *   - /browse             — Configure the visit_page subagent (provider, model, etc.)
@@ -54,13 +60,8 @@ import {
   type SubagentConfig,
 } from "./src/subagent.js";
 import {
-  VISIT_PAGE_DESCRIPTION_WITH_SUMMARY,
-  VISIT_PAGE_DESCRIPTION_WITHOUT_SUMMARY,
-  VISIT_PAGE_PROMPT_SNIPPET_WITH_SUMMARY,
-  VISIT_PAGE_PROMPT_SNIPPET_WITHOUT_SUMMARY,
-  VISIT_PAGE_GUIDELINES_WITH_SUMMARY,
-  VISIT_PAGE_GUIDELINES_WITHOUT_SUMMARY,
-  stripSummaryArgument,
+  visitPageSurface,
+  stripDisabledArguments,
 } from "./src/tool-surface.js";
 
 type RenderArgs = { query?: string; url?: string; clean?: boolean; summary?: boolean };
@@ -92,49 +93,42 @@ function updateStatus(ctx: {
   ctx.ui.setStatus("browse", undefined);
 }
 
-const VISIT_PAGE_URL_PARAM = Type.String({ description: "Full URL to visit" });
-
-const VISIT_PAGE_CLEAN_PARAM = Type.Optional(
-  Type.Boolean({
-    description:
-      "Extract only the page's main article content as clean Markdown (via Defuddle) instead of the default block-walker. Drops navigation, sidebars, ads, footers, and the visible-links dump — far fewer tokens. Best for articles, docs, blog posts. No effect on X/Reddit/Amazon/Scholar (already clean). Falls back to the generic extractor if Defuddle fails. Avoid on non-article pages (dashboards, indexes) where there is no clear main content. Preserves content links (article URLs, citations) but drops chrome links (nav/footer/action buttons).",
-  }),
-);
-
-const VISIT_PAGE_SUMMARY_PARAM = Type.Optional(
-  Type.Boolean({
-    description:
-      "When true, the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page — the raw page markdown is NOT added to your chat context. Use this for large pages to keep the conversation compact. The subagent reuses your current Pi model by default; pin a different one with /browse. Combine with `clean: true` for articles (gives the subagent clean text, avoiding nav noise and truncation). Avoid when you need verbatim text (code, API signatures, exact numbers) since the subagent paraphrases, or when the page is already small.",
-  }),
-);
-
 /**
  * Build the visit_page tool definition from the current config.
  *
- * With summaryEnabled: false the summary option is hidden from the model
- * completely: the parameter is omitted from the schema and the description,
- * prompt snippet, and guidelines are swapped for variants that never mention
- * it. Registered by syncVisitPageTool() in the factory and re-registered on
- * /browse on|off, so a config change applies to the next turn.
+ * The `summaryEnabled` and `cleanEnabled` flags each gate one optional feature.
+ * A disabled feature is hidden from the model completely: its parameter is
+ * omitted from the schema and the description, prompt snippet, and guidelines
+ * are built without any mention of it. Registered by syncVisitPageTool() in
+ * the factory and re-registered on /browse on|off and /browse clean on|off, so
+ * a config change applies to the next turn.
  */
 function visitPageToolDefinition() {
-  const summariesOffered = config.summaryEnabled;
+  const summaryEnabled = config.summaryEnabled;
+  const cleanEnabled = config.cleanEnabled;
+  const surface = visitPageSurface({ summaryEnabled, cleanEnabled });
+
+  const parameters = Type.Object({
+    url: Type.String({ description: "Full URL to visit" }),
+    ...(cleanEnabled
+      ? { clean: Type.Optional(Type.Boolean({ description: surface.cleanParamDescription })) }
+      : {}),
+    ...(summaryEnabled
+      ? { summary: Type.Optional(Type.Boolean({ description: surface.summaryParamDescription })) }
+      : {}),
+  });
+
   return {
     name: "visit_page",
     label: "Visit Page",
-    description: summariesOffered
-      ? VISIT_PAGE_DESCRIPTION_WITH_SUMMARY
-      : VISIT_PAGE_DESCRIPTION_WITHOUT_SUMMARY,
-    promptSnippet: summariesOffered
-      ? VISIT_PAGE_PROMPT_SNIPPET_WITH_SUMMARY
-      : VISIT_PAGE_PROMPT_SNIPPET_WITHOUT_SUMMARY,
-    promptGuidelines: summariesOffered
-      ? VISIT_PAGE_GUIDELINES_WITH_SUMMARY
-      : VISIT_PAGE_GUIDELINES_WITHOUT_SUMMARY,
-    parameters: summariesOffered
-      ? Type.Object({ url: VISIT_PAGE_URL_PARAM, clean: VISIT_PAGE_CLEAN_PARAM, summary: VISIT_PAGE_SUMMARY_PARAM })
-      : Type.Object({ url: VISIT_PAGE_URL_PARAM, clean: VISIT_PAGE_CLEAN_PARAM }),
-    prepareArguments: summariesOffered ? undefined : (args: unknown) => stripSummaryArgument(args),
+    description: surface.description,
+    promptSnippet: surface.promptSnippet,
+    promptGuidelines: surface.promptGuidelines,
+    parameters,
+    prepareArguments:
+      summaryEnabled && cleanEnabled
+        ? undefined
+        : (args: unknown) => stripDisabledArguments(args, { summaryEnabled, cleanEnabled }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const { url, clean } = params;
       if (!url || !url.trim()) {
@@ -155,6 +149,7 @@ function visitPageToolDefinition() {
       }
 
       const summarize = config.summaryEnabled && (params as { summary?: unknown }).summary === true;
+      const useClean = config.cleanEnabled && clean === true;
 
       // ── Summary mode: resolve the subagent BEFORE fetching ────────────────
       // Resolves config/model/auth up front so a misconfigured subagent does
@@ -236,7 +231,7 @@ function visitPageToolDefinition() {
               details: { _progress: true },
             });
           },
-          clean: clean === true,
+          clean: useClean,
         });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -276,7 +271,7 @@ function visitPageToolDefinition() {
       if (!summarize) {
         return {
           content: [{ type: "text" as const, text: result.markdown }],
-          details: { url: result.url, elapsed: `${fetchElapsed}s`, chars: result.markdown.length, clean: clean === true },
+          details: { url: result.url, elapsed: `${fetchElapsed}s`, chars: result.markdown.length, clean: useClean },
         };
       }
 
@@ -483,6 +478,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         if (data.maxTokens !== undefined) config.maxTokens = data.maxTokens;
         if (data.defaultReasoningEffort !== undefined) config.defaultReasoningEffort = data.defaultReasoningEffort;
         if (data.summaryEnabled !== undefined) config.summaryEnabled = data.summaryEnabled;
+        if (data.cleanEnabled !== undefined) config.cleanEnabled = data.cleanEnabled;
         if (data.proxy !== undefined) config.proxy = data.proxy;
       }
     }
@@ -568,6 +564,33 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
 
       if (subcommand === "show" || subcommand === "status") {
         ctx.ui.notify(configSummary(ctx.model), "info");
+        return;
+      }
+
+      // /browse clean on|off — toggle clean mode independently of summary mode
+      if (subcommand === "clean") {
+        const value = rest.trim().toLowerCase();
+        if (!value) {
+          ctx.ui.notify(
+            `Clean mode is currently ${config.cleanEnabled ? "enabled" : "disabled"}. Use /browse clean on|off.`,
+            "info",
+          );
+          return;
+        }
+        if (value !== "on" && value !== "off") {
+          ctx.ui.notify(`Invalid value: "${rest}". Use /browse clean on|off.`, "error");
+          return;
+        }
+        config.cleanEnabled = value === "on";
+        saveConfigFile();
+        persistConfig();
+        syncVisitPageTool();
+        ctx.ui.notify(
+          config.cleanEnabled
+            ? "Clean mode enabled — visit_page now offers `clean: true` to the model."
+            : "Clean mode disabled — visit_page no longer advertises or accepts `clean`; the default extractor is always used.",
+          "info",
+        );
         return;
       }
 
@@ -722,7 +745,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `Unknown subcommand: "${subcommand}". Use: config, show, clear, on, off (or provider/model)`,
+        `Unknown subcommand: "${subcommand}". Use: config, show, clear, on, off, clean (or provider/model)`,
         "error",
       );
     },
@@ -803,9 +826,10 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
 
   // ── visit_page tool ──────────────────────────────────────────────────────
   // visit_page is (re)registered from the current config by syncVisitPageTool().
-  // With summaryEnabled: false the summary option is hidden from the model; pi replaces
-  // a same-named tool and refreshes the registry in the same session, so
-  // /browse on|off take effect on the next turn.
+  // The flags (`summaryEnabled`, `cleanEnabled`) hide their option and every
+  // mention of it from the model; pi replaces a same-named tool and refreshes
+  // the registry in the same session, so /browse on|off and /browse clean
+  // on|off take effect on the next turn.
   const syncVisitPageTool = () => pi.registerTool(visitPageToolDefinition());
   syncVisitPageTool();
 

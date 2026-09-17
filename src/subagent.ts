@@ -21,10 +21,11 @@
  *
  * Env-var fallbacks (optional overrides; else current model is used):
  * PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
- * PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED.
+ * PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED,
+ * PI_BROWSE_CLEAN_ENABLED.
  *
- * `summaryEnabled` selects whether `visit_page` offers its `summary` option at
- * all (it does not disable the tool itself).
+ * `summaryEnabled` and `cleanEnabled` select whether `visit_page` offers its
+ * `summary` / `clean` options at all (they never disable the tool itself).
  *
  * The same file also configures the browser itself (proxy), written as
  * `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
@@ -68,6 +69,12 @@ export interface SubagentConfig {
    *  returned as raw markdown. It does not disable the tool itself. Toggled
    *  with /browse on|off. */
   summaryEnabled: boolean;
+  /** Whether `visit_page` offers `clean` mode (the Defuddle reader-mode
+   *  extraction). When false the option is hidden from the model completely —
+   *  no `clean` parameter and no mention of it (or of combining it with
+   *  `summary`) anywhere in the tool surface. It does not disable the tool
+   *  itself. Toggled with /browse clean on|off. */
+  cleanEnabled: boolean;
   /** Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
    *  string means a direct connection. Passed to Chrome at launch, so a
    *  change takes effect on the next Chrome start (the next tool call
@@ -81,6 +88,7 @@ const DEFAULT_CONFIG: SubagentConfig = {
   maxTokens: DEFAULT_MAX_TOKENS,
   defaultReasoningEffort: "off",
   summaryEnabled: true,
+  cleanEnabled: true,
   proxy: "",
 };
 
@@ -222,6 +230,7 @@ export function saveConfigFile(): void {
       maxTokens: config.maxTokens,
       defaultReasoningEffort: config.defaultReasoningEffort,
       summaryEnabled: config.summaryEnabled,
+      cleanEnabled: config.cleanEnabled,
       browser: { proxy: config.proxy },
     };
     writeFileSync(path, JSON.stringify(out, null, 2) + "\n");
@@ -244,6 +253,8 @@ export function resolveConfig(): SubagentConfig {
   const fileReasoning = validateReasoningLevel(asString(file?.defaultReasoningEffort));
   const fileSummaryEnabled = asBool(file?.summaryEnabled);
   const envSummaryEnabled = asEnvBool(process.env.PI_BROWSE_SUMMARY_ENABLED);
+  const fileCleanEnabled = asBool(file?.cleanEnabled);
+  const envCleanEnabled = asEnvBool(process.env.PI_BROWSE_CLEAN_ENABLED);
   // Browser settings may live under `browser` (documented shape, what
   // saveConfigFile writes) or at the top level (hand-written convenience).
   const fileBrowser =
@@ -259,6 +270,7 @@ export function resolveConfig(): SubagentConfig {
         : parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? String(DEFAULT_MAX_TOKENS), 10),
     defaultReasoningEffort: fileReasoning ?? envReasoning ?? "off",
     summaryEnabled: fileSummaryEnabled ?? envSummaryEnabled ?? true,
+    cleanEnabled: fileCleanEnabled ?? envCleanEnabled ?? true,
     proxy:
       normalizeProxy(fileBrowser.proxy) ??
       normalizeProxy(file?.proxy) ??
@@ -299,6 +311,7 @@ export function configSummary(
     `  Max tokens:        ${config.maxTokens}`,
     `  Reasoning effort:  ${config.defaultReasoningEffort}`,
     `  Summary mode:      ${config.summaryEnabled ? "enabled (visit_page offers `summary: true`)" : "disabled (visit_page returns raw pages, no summary option shown)"}`,
+    `  Clean mode:        ${config.cleanEnabled ? "enabled (visit_page offers `clean: true`)" : "disabled (visit_page always uses the default extractor)"}`,
     `  Chrome proxy:      ${config.proxy || "(direct, no proxy)"}`,
     ``,
     `Config file: ${configPath()}`,
@@ -314,11 +327,20 @@ export function configSummary(
           "is hidden from the model and pages are always returned as raw markdown. The model",
           "settings above are kept for when you re-enable it with /browse on.",
         ]),
+    ...(config.cleanEnabled
+      ? []
+      : [
+          "",
+          "Clean mode is disabled: visit_page does not offer `clean` at all — the option is",
+          "hidden from the model and the default block-walker extractor is always used.",
+          "Re-enable it with /browse clean on.",
+        ]),
     ``,
     "By default the subagent reuses your current Pi model (shown above) with its",
     "already-configured auth — no API keys to set up. To pin a different model:",
     "  /browse provider <provider>   /browse model <model-id>",
-    "Other settings: max-tokens, reasoning-effort, proxy. Use /browse on|off to toggle.",
+    "Other settings: max-tokens, reasoning-effort, proxy. Summary mode: /browse on|off.",
+    "Clean mode: /browse clean on|off.",
     "",
     "The Chrome proxy is applied when Chrome is launched; changing it restarts the",
     "tool's Chrome on the next google_search / visit_page call.",

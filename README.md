@@ -55,13 +55,14 @@ Visit any URL and get the page content as markdown. Two optional parameters keep
 - **`summary`** — delegate to a subagent model that returns only a concise summary of the whole page (the raw page never enters your context; reuses your current model by default). [See below.](#optional-summary--keep-your-chat-context-small)
 - **`clean`** — extract with Defuddle reader-mode (drops nav/sidebars/ads; ~47% fewer tokens). [See below.](#optional-clean--clean-article-markdown-via-defuddle)
 
-`summary` is only offered when summary mode is enabled (the default). Disable it
-with `"summaryEnabled": false` in the config file, `PI_BROWSE_SUMMARY_ENABLED=0`,
-or `/browse off` and the option disappears entirely: the `summary` parameter is
-removed from the tool schema and the description, prompt snippet, and guidelines
-are swapped for variants that never mention it — the model is not told the option
-exists, and `visit_page` always returns the extracted page markdown. This flag
-gates only summary mode; `url`/`clean` and `google_search` are unaffected.
+`summary` and `clean` are each offered only while their mode is enabled (both
+are on by default). Disable either with `"summaryEnabled": false` /
+`"cleanEnabled": false` in the config file, `PI_BROWSE_SUMMARY_ENABLED=0` /
+`PI_BROWSE_CLEAN_ENABLED=0`, or `/browse off` / `/browse clean off`: that flag's
+parameter is removed from the tool schema and every mention of it disappears from
+the description, prompt snippet, and guidelines — the model is not told the
+option exists. Disabling one feature never affects the other, `url`, or
+`google_search`.
 
 ```
 visit_page({ url: "https://example.com/article" })
@@ -168,6 +169,13 @@ markdown. Your pinned model and settings are kept, so `/browse on` restores the
 option on the next turn. This differs from the old behavior, where a disabled
 subagent still advertised `summary` and returned an error when the model used
 it.
+
+**Disabling clean mode.** `"cleanEnabled": false` (or `/browse clean off`, or
+`PI_BROWSE_CLEAN_ENABLED=0`) hides the `clean` option the same way: the
+parameter is removed and every mention of it disappears — including the
+"Combine with `clean: true`" sentence in the summary parameter's own
+description. The default page extraction is always used. Clean and summary mode
+are independent: disabling either leaves the other untouched.
 
 ### Optional `clean` — clean article Markdown via Defuddle
 
@@ -289,6 +297,7 @@ only if you want to pin a different (e.g. cheaper/faster) model:
 /browse                          # show current config
 /browse on                       # enable summary mode (default)
 /browse off                      # disable: hide `summary` from the model; raw pages are returned
+/browse clean on|off             # enable/disable clean mode (hide `clean` from the model)
 /browse provider openai          # pin a provider (overrides current model)
 /browse model gpt-4o-mini        # pin a model (overrides current model)
 /browse max-tokens 2048          # max output tokens for the summary
@@ -312,6 +321,7 @@ restored when you reopen one.
 // ~/.pi/agent/search-on-your-browser.json
 {
   "summaryEnabled": false,             // hide visit_page's `summary` option entirely
+  "cleanEnabled": false,               // hide visit_page's `clean` option entirely
   "browser": { "proxy": "http://127.0.0.1:8010" }
 }
 ```
@@ -326,6 +336,7 @@ startup; the config file wins over these once set):
 | `PI_BROWSE_MAX_TOKENS` | `2048` | max output tokens for the summary |
 | `PI_BROWSE_REASONING_EFFORT` | `off` | thinking level for reasoning models |
 | `PI_BROWSE_SUMMARY_ENABLED` | `1` | `0`/`false`/`no`/`off` hides `visit_page`'s `summary` option |
+| `PI_BROWSE_CLEAN_ENABLED` | `1` | `0`/`false`/`no`/`off` hides `visit_page`'s `clean` option |
 | `PI_SEARCH_PROXY` | — | proxy for the Chrome browser (see below) |
 
 ### Proxy — browsing through a proxy
@@ -378,13 +389,13 @@ The test suite runs without a browser, without a network, and with **zero runtim
 npm test
 ```
 
-Five layers of tests (98 total):
+Five layers of tests (108 total):
 
 - **`tests/unit/urls.test.ts`** — table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - **`tests/unit/extractors-parse.test.ts`** — validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
 - **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise).
-- **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` flag from file and `PI_BROWSE_SUMMARY_ENABLED`), reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. Also covers the browser proxy config: value normalization (`host:port` → `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
-- **`tests/unit/tool-surface.test.ts`** — asserts the agent-facing `visit_page` text: the without-summary variants (used when summary mode is disabled) never mention summarization or `/browse`, while still documenting the site extractors and `clean`; the two variants share their base text; and `stripSummaryArgument` removes a stale `summary` argument without mutating the input or dropping `url`/`clean`.
+- **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. Also covers the browser proxy config: value normalization (`host:port` → `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
+- **`tests/unit/tool-surface.test.ts`** — asserts the agent-facing `visit_page` text across all four `summaryEnabled` × `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled; no site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere; and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 
 ### Type-checking
 
@@ -419,6 +430,7 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 - **The `🌐` footer indicator no longer duplicates the model Pi already shows.** In the default (unpinned) configuration the subagent reuses the current session model, so the status line rendered the exact same `provider/model` as Pi's own footer — one line of pure noise. It now appears only when the subagent is pinned to a *different* model (`/browse provider` + `/browse model`), the one case Pi's footer can't tell you about; the transient spinner during a summary call is unchanged. The `/browse on` message and README were updated to match.
 - **Fix: extension diagnostics no longer leak onto the TUI input line.** `src/chrome.ts` wrote `[pi-search] ...` messages (Chrome launched/ready/exited, launch flags changed) straight to stderr with `console.error()`. Pi's TUI runs in raw mode and renders raw stderr writes on the text input bar, so they showed up as noise while typing. All diagnostics now go through a `debugLog()` helper that writes only when `PI_SEARCH_DEBUG` is set. Progress the user should actually see ("Launching Chrome...", "Restarting Chrome...") is reported through the tool's `onStatus` callback instead — rendered inside the tool call block, where it belongs. A new regression test asserts the only `console.*` call in `chrome.ts` is the gated one. Verified: a full `google_search` through Chrome emits **0 bytes** on stderr by default, while `PI_SEARCH_DEBUG=1` restores the diagnostics.
 - **New: `summaryEnabled: false` now hides `visit_page`'s `summary` option from the model instead of erroring.** Previously a disabled subagent still advertised `summary: true` in the tool description and guidelines, and returned an error when the model used it. Now `summaryEnabled: false` (config file), `PI_BROWSE_SUMMARY_ENABLED=0` (new env var), or `/browse off` removes the `summary` property from the tool schema and swaps the description, prompt snippet, and guidelines for variants that never mention summarization — the model is not told the option exists, and pages are always returned as extracted markdown. The flag was renamed from the ambiguous `enabled`, which only ever gated summary mode — `url`/`clean` and `google_search` were never affected. Existing configs that set `enabled` must rename it to `summaryEnabled` (the old key is ignored). `visit_page` is re-registered from the current config on `session_start` and on `/browse on|off|clear`, so changes take effect on the next turn (pi replaces a same-named tool and refreshes the registry in the same session). A stale `summary: true` argument (e.g. from earlier conversation context) is stripped by a `prepareArguments` shim and ignored. `/browse` now reports `Summary mode: enabled|disabled`. The agent-facing strings moved to `src/tool-surface.ts` so unit tests can assert the hidden variant never contains "summary" or "/browse" (14 new tests; 98 total). Verified by loading the extension through pi's own extension loader and inspecting the registered tool definition in both config states.
+- **New: `cleanEnabled` gives clean mode the same treatment, and the tool surface is now minimal.** `visit_page`'s `clean` option is gated independently of `summary`: `cleanEnabled: false` (config file), `PI_BROWSE_CLEAN_ENABLED=0`, or `/browse clean off` removes the `clean` parameter and hides every mention of it — including the "Combine with `clean: true`" sentence in the summary parameter's own description. The text sent to the model was reorganized so the tool description stays minimal and only grows as features are enabled (base → +clean → +summary), and it no longer enumerates the site-specific extractors (X/Twitter, Reddit, Amazon, Google Scholar): extraction is automatic, so the model does not need to know which sites have dedicated extractors — those details remain in the README. `/browse` reports `Clean mode: enabled|disabled`. 10 new tests (108 total).
 
 ### v0.8.0
 

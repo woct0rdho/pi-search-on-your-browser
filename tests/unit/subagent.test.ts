@@ -251,11 +251,13 @@ function withTempConfigDir(fn: (dir: string) => void): void {
   const originalDir = dirname(configPath());
   const originalProxyEnv = process.env.PI_SEARCH_PROXY;
   const originalSummaryEnv = process.env.PI_BROWSE_SUMMARY_ENABLED;
+  const originalCleanEnv = process.env.PI_BROWSE_CLEAN_ENABLED;
   const dir = mkdtempSync(join(tmpdir(), "pi-search-cfg-"));
   try {
     setConfigDir(dir);
     delete process.env.PI_SEARCH_PROXY;
     delete process.env.PI_BROWSE_SUMMARY_ENABLED;
+    delete process.env.PI_BROWSE_CLEAN_ENABLED;
     fn(dir);
   } finally {
     setConfigDir(originalDir);
@@ -263,6 +265,8 @@ function withTempConfigDir(fn: (dir: string) => void): void {
     else process.env.PI_SEARCH_PROXY = originalProxyEnv;
     if (originalSummaryEnv === undefined) delete process.env.PI_BROWSE_SUMMARY_ENABLED;
     else process.env.PI_BROWSE_SUMMARY_ENABLED = originalSummaryEnv;
+    if (originalCleanEnv === undefined) delete process.env.PI_BROWSE_CLEAN_ENABLED;
+    else process.env.PI_BROWSE_CLEAN_ENABLED = originalCleanEnv;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -432,5 +436,101 @@ test("configSummary: reports the hidden summary option when disabled", () => {
     assert.ok(/hidden from the model/i.test(summary), "should explain that the option is hidden");
   } finally {
     __config.summaryEnabled = saved;
+  }
+});
+
+// ── clean-mode configuration (`cleanEnabled`) ─────────────────────────────
+// Clean mode is toggled independently of summary mode: `cleanEnabled: false`
+// hides the `clean` option from the model without affecting `summary` (and
+// vice versa). Same resolution rules as summaryEnabled.
+
+test("resolveConfig: clean mode defaults to enabled", () => {
+  withTempConfigDir(() => {
+    assert.equal(resolveConfig().cleanEnabled, true);
+  });
+});
+
+test("resolveConfig: reads cleanEnabled from the config file", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ cleanEnabled: false }));
+    assert.equal(resolveConfig().cleanEnabled, false);
+  });
+});
+
+test("resolveConfig: the two feature flags are independent", () => {
+  withTempConfigDir((dir) => {
+    writeFileSync(
+      join(dir, "search-on-your-browser.json"),
+      JSON.stringify({ summaryEnabled: false, cleanEnabled: true }),
+    );
+    assert.equal(resolveConfig().summaryEnabled, false);
+    assert.equal(resolveConfig().cleanEnabled, true);
+
+    writeFileSync(
+      join(dir, "search-on-your-browser.json"),
+      JSON.stringify({ summaryEnabled: true, cleanEnabled: false }),
+    );
+    assert.equal(resolveConfig().summaryEnabled, true);
+    assert.equal(resolveConfig().cleanEnabled, false);
+  });
+});
+
+test("resolveConfig: PI_BROWSE_CLEAN_ENABLED can disable clean mode", () => {
+  withTempConfigDir(() => {
+    for (const truthy of ["1", "true", "yes", "on", "TRUE"]) {
+      process.env.PI_BROWSE_CLEAN_ENABLED = truthy;
+      assert.equal(resolveConfig().cleanEnabled, true, `"${truthy}" should enable`);
+    }
+    for (const falsy of ["0", "false", "no", "off", "FALSE"]) {
+      process.env.PI_BROWSE_CLEAN_ENABLED = falsy;
+      assert.equal(resolveConfig().cleanEnabled, false, `"${falsy}" should disable`);
+    }
+    process.env.PI_BROWSE_CLEAN_ENABLED = "maybe";
+    assert.equal(resolveConfig().cleanEnabled, true, "unparseable values fall back to the default");
+  });
+});
+
+test("resolveConfig: the config file wins over PI_BROWSE_CLEAN_ENABLED", () => {
+  withTempConfigDir((dir) => {
+    process.env.PI_BROWSE_CLEAN_ENABLED = "0";
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ cleanEnabled: true }));
+    assert.equal(resolveConfig().cleanEnabled, true, "the file should win over the env var");
+
+    writeFileSync(join(dir, "search-on-your-browser.json"), JSON.stringify({ cleanEnabled: false }));
+    process.env.PI_BROWSE_CLEAN_ENABLED = "1";
+    assert.equal(resolveConfig().cleanEnabled, false, "the file should win over the env var");
+  });
+});
+
+test("saveConfigFile: round-trips cleanEnabled = false", () => {
+  withTempConfigDir((dir) => {
+    const saved = __config.cleanEnabled;
+    try {
+      __config.cleanEnabled = false;
+      saveConfigFile();
+      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
+      assert.equal(raw.cleanEnabled, false);
+      assert.equal(resolveConfig().cleanEnabled, false);
+    } finally {
+      __config.cleanEnabled = saved;
+    }
+  });
+});
+
+test("configSummary: reports clean mode on or off", () => {
+  const saved = __config.cleanEnabled;
+  try {
+    __config.cleanEnabled = true;
+    const on = configSummary({ provider: "openai", id: "gpt-4o" });
+    const onLine = on.split("\n").find((l) => l.includes("Clean mode:"));
+    assert.ok(onLine?.includes("enabled"), `clean-mode line should say enabled: ${onLine}`);
+
+    __config.cleanEnabled = false;
+    const off = configSummary({ provider: "openai", id: "gpt-4o" });
+    const offLine = off.split("\n").find((l) => l.includes("Clean mode:"));
+    assert.ok(offLine?.includes("disabled"), `clean-mode line should say disabled: ${offLine}`);
+    assert.ok(/\/browse clean on/.test(off), "should point at /browse clean on");
+  } finally {
+    __config.cleanEnabled = saved;
   }
 });
