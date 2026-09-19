@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { runInPageSession, CHROME_LAUNCH_ARGS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
+import { runInPageSession, CHROME_LAUNCH_ARGS, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 
 // ── Fake CDP ───────────────────────────────────────────────────────────────
@@ -9,7 +9,7 @@ import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 // browser or WebSocket. Records every call/evaluate for assertions.
 
 class FakeCDP implements CDPLike {
-  calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  calls: Array<{ method: string; params?: Record<string, unknown>; timeoutMs?: number }> = [];
   evaluations: string[] = [];
   /** Per-expression results. If an expression is in this map, evaluate()
    *  returns the mapped value instead of extractionResult. Lets tests
@@ -24,12 +24,28 @@ class FakeCDP implements CDPLike {
    *  Network.responseReceived event with this status. 0 = don't emit. */
   docResponseStatus = 0;
   docResponseStatusText = "";
+  /** How many upcoming Page.navigate calls fail with a timeout (simulates a
+   *  stalled browser/proxy). Set before runInPageSession. */
+  navigateTimeouts = 0;
+  /** Error text used for those failures. */
+  navigateTimeoutMessage = "CDP call timeout: Page.navigate";
+  /** When true, Page.navigate never answers — but the page still loads, which
+   *  is what a slow navigation looks like when the load event fires first. */
+  navigateHangs = false;
   private loadHandlers: Array<(params: unknown) => void> = [];
   private networkHandlers: Array<(params: unknown) => void> = [];
 
-  async call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    this.calls.push({ method, params });
+  async call(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+  ): Promise<unknown> {
+    this.calls.push({ method, params, timeoutMs });
     if (method === "Page.navigate") {
+      if (this.navigateTimeouts > 0) {
+        this.navigateTimeouts--;
+        throw new Error(this.navigateTimeoutMessage);
+      }
       // Emit the document's Network.responseReceived event BEFORE load
       // (mirrors real CDP ordering: response received → load event fires).
       if (this.docResponseStatus > 0) {
@@ -47,6 +63,7 @@ class FakeCDP implements CDPLike {
       }
       // Fire load handlers synchronously (registered before navigate).
       for (const h of this.loadHandlers) h({});
+      if (this.navigateHangs) return new Promise<never>(() => {});
     }
     return {};
   }
@@ -508,6 +525,91 @@ test("chrome.ts writes to stderr only behind PI_SEARCH_DEBUG", () => {
     source.slice(fnStart, fnEnd).includes("PI_SEARCH_DEBUG"),
     "debugLog must be gated by PI_SEARCH_DEBUG",
   );
+});
+
+// ── Navigation resilience (parallel tool calls / slow browsers) ──────────
+// Real-world failure: the agent issued two visit_page calls in parallel; under
+// a slow proxy the pages took >30s, and the fixed per-call CDP timeout killed
+// one of them with "visit_page failed: CDP call timeout: Page.navigate".
+// Page.navigate is now retried, accepted as soon as the page loads, and a dead
+// CDP socket fails immediately instead of waiting out the timeout.
+
+test("Page.navigate is retried when the command times out", async () => {
+  const fake = new FakeCDP();
+  fake.navigateTimeouts = 2; // two stalled attempts, third succeeds
+
+  const statuses: string[] = [];
+  const result = await runInPageSession(fake, baseOpts({ onStatus: (m) => statuses.push(m) }));
+
+  assert.equal(result, "extracted content", "the call should succeed after retrying");
+  const navigations = fake.calls.filter((c) => c.method === "Page.navigate");
+  assert.equal(navigations.length, 3, "should have attempted 3 navigations");
+  assert.equal(
+    navigations[0].timeoutMs,
+    NAVIGATE_TIMEOUT_MS,
+    "each attempt should use the short per-attempt timeout",
+  );
+  assert.ok(
+    statuses.some((s) => s.includes("retrying")),
+    `the user should see the retry in the tool UI: ${statuses.join(" | ")}`,
+  );
+});
+
+test("Page.navigate gives up after NAVIGATE_ATTEMPTS with a clear error", async () => {
+  const fake = new FakeCDP();
+  fake.navigateTimeouts = 99;
+
+  await assert.rejects(
+    () => runInPageSession(fake, baseOpts()),
+    (err: Error) => {
+      assert.ok(err.message.includes("CDP call timeout: Page.navigate"), `got: ${err.message}`);
+      assert.ok(err.message.includes(String(NAVIGATE_ATTEMPTS)), `should mention attempts: ${err.message}`);
+      assert.ok(/slow/i.test(err.message), `should hint at slowness: ${err.message}`);
+      return true;
+    },
+  );
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Page.navigate").length,
+    NAVIGATE_ATTEMPTS,
+    "should stop after the attempt budget",
+  );
+});
+
+test("a non-timeout navigation error is NOT retried (dead socket fails fast)", async () => {
+  const fake = new FakeCDP();
+  fake.navigateTimeouts = 99;
+  fake.navigateTimeoutMessage = "CDP connection closed";
+
+  await assert.rejects(() => runInPageSession(fake, baseOpts()), /CDP connection closed/);
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Page.navigate").length,
+    1,
+    "a dead connection must not be retried",
+  );
+});
+
+test("a page that loads while Page.navigate is still pending is accepted", async () => {
+  const fake = new FakeCDP();
+  fake.navigateHangs = true; // command never answers, but the load event fires
+
+  const result = await runInPageSession(fake, baseOpts());
+
+  assert.equal(result, "extracted content", "the load event should unblock the session");
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Page.navigate").length,
+    1,
+    "no retry is needed once the page has loaded",
+  );
+});
+
+test("Page.navigate passes the short timeout, other calls keep the default", async () => {
+  const fake = new FakeCDP();
+  await runInPageSession(fake, baseOpts());
+
+  const navigate = fake.calls.find((c) => c.method === "Page.navigate");
+  assert.equal(navigate?.timeoutMs, NAVIGATE_TIMEOUT_MS);
+  const evaluate = fake.calls.find((c) => c.method === "Runtime.enable");
+  assert.equal(evaluate?.timeoutMs, undefined, "non-navigate calls use the client default");
 });
 
 // ── Chrome launch flags (keep renderer alive in background) ───────────────

@@ -41,6 +41,24 @@ const CDP_PORT = 9322;
 const CDP_TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 1_048_576; // 1 MB
 
+/** Timeout for the small HTTP calls to Chrome's DevTools endpoint
+ *  (/json/version, /json/close). They answer instantly while Chrome is alive;
+ *  without a timeout a wedged browser would hang the tool forever. */
+const CDP_HTTP_TIMEOUT_MS = 3_000;
+
+/**
+ * `Page.navigate` normally answers in milliseconds, but it is dispatched
+ * through the browser process and can stall for tens of seconds when the
+ * browser is busy: several parallel tool tabs loading heavy pages at once, a
+ * proxy re-establishing its tunnels, or a background renderer that is still
+ * starting up. A single stall used to fail the whole tool call with "CDP call
+ * timeout: Page.navigate" (observed for real: two parallel GitHub visits
+ * through a slow proxy, one navigation took >30s). The command is idempotent
+ * for a fixed URL, so a timed-out attempt is retried.
+ */
+export const NAVIGATE_TIMEOUT_MS = 15_000;
+export const NAVIGATE_ATTEMPTS = 3;
+
 // ── Utilities ─────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
@@ -128,7 +146,7 @@ interface PendingCall {
  *  tests pass a fake so the navigate/waitForSelector/extract logic can be
  *  exercised without a real browser or WebSocket. */
 interface CDPLike {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
   evaluate(expression: string): Promise<string>;
   onEvent(method: string, handler: (params: unknown) => void): void;
   disconnect(): void;
@@ -154,6 +172,15 @@ class CDPClient implements CDPLike {
       ws.onopen = () => {
         clearTimeout(timer);
         resolve();
+      };
+
+      // The socket can die at any time (Chrome killed, tab/target crashed, a
+      // restart). Reject the in-flight calls immediately so callers get a real
+      // error instead of waiting out the full per-call timeout — otherwise a
+      // dead target turns into a misleading "CDP call timeout" 30s later.
+      ws.onclose = () => {
+        clearTimeout(timer);
+        this.failPending("CDP connection closed");
       };
 
       ws.onmessage = (event) => {
@@ -185,10 +212,21 @@ class CDPClient implements CDPLike {
 
       ws.onerror = () => {
         clearTimeout(timer);
-        reject(new Error("WebSocket connection error"));
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.failPending("CDP connection error");
+        } else {
+          reject(new Error("WebSocket connection error"));
+        }
       };
     });
     await this.connectPromise;
+  }
+
+  /** Reject every in-flight call (used when the socket dies). */
+  private failPending(reason: string): void {
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    for (const cb of pending) cb.reject(new Error(reason));
   }
 
   onEvent(method: string, handler: (params: unknown) => void) {
@@ -197,7 +235,11 @@ class CDPClient implements CDPLike {
     this.eventHandlers.set(method, handlers);
   }
 
-  async call(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  async call(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs: number = CDP_TIMEOUT_MS,
+  ): Promise<unknown> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("CDP not connected");
     }
@@ -208,7 +250,7 @@ class CDPClient implements CDPLike {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`CDP call timeout: ${method}`));
-      }, CDP_TIMEOUT_MS);
+      }, timeoutMs);
 
       this.pending.set(id, {
         resolve: (v) => { clearTimeout(timer); resolve(v); },
@@ -240,6 +282,9 @@ class CDPClient implements CDPLike {
 // ── Chrome process management ─────────────────────────────────────────────
 
 let chromeProcess: ChildProcess | null = null;
+/** Serializes Chrome start/restart decisions across parallel tool calls (see
+ *  withChromeLifecycle). Also covers shutdownChrome(). */
+let chromeLifecycle: Promise<unknown> = Promise.resolve();
 /** Args of the Chrome started by *this* process (null when the live Chrome was
  *  started elsewhere — an earlier Pi session using the same profile). */
 let launchedArgs: string[] | null = null;
@@ -249,7 +294,9 @@ let canPersistLaunchArgs = true;
 
 async function isChromeAlive(): Promise<boolean> {
   try {
-    const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`);
+    const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`, {
+      signal: AbortSignal.timeout(CDP_HTTP_TIMEOUT_MS),
+    });
     return resp.ok;
   } catch {
     return false;
@@ -420,34 +467,54 @@ async function launchChrome(args: readonly string[], status: StatusFn): Promise<
 }
 
 async function ensureChrome(status: StatusFn): Promise<void> {
-  const desired = chromeLaunchArgs();
+  return withChromeLifecycle(async () => {
+    const desired = chromeLaunchArgs();
 
-  if (await isChromeAlive()) {
-    // What were the running Chrome's flags? Our own record wins; otherwise the
-    // marker file left by the process that launched it.
-    const current = launchedArgs ?? readLaunchMarker();
-    if (current && sameArgs(current, desired)) return;
+    if (await isChromeAlive()) {
+      // What were the running Chrome's flags? Our own record wins; otherwise
+      // the marker file left by the process that launched it.
+      const current = launchedArgs ?? readLaunchMarker();
+      if (current && sameArgs(current, desired)) return;
 
-    // Unknown flags (Chrome started by an older version, before the marker
-    // existed). Restart it once so the current flags — including a proxy — are
-    // actually applied and recorded; if the marker can't be written we'd
-    // restart on every single call, so leave it alone instead.
-    if (current === null && !canPersistLaunchArgs) return;
+      // Unknown flags (Chrome started by an older version, before the marker
+      // existed). Restart it once so the current flags — including a proxy —
+      // are actually applied and recorded; if the marker can't be written we'd
+      // restart on every single call, so leave it alone instead.
+      if (current === null && !canPersistLaunchArgs) return;
 
-    debugLog(
-      current
-        ? "Chrome launch flags changed — restarting Chrome"
-        : "Restarting Chrome to align its launch flags"
-    );
-    status(current ? "Restarting Chrome to apply updated launch flags..." : "Restarting Chrome...");
-    await stopChrome();
-  } else if (chromeProcess) {
-    chromeProcess.kill();
-    chromeProcess = null;
-    await sleep(500);
-  }
+      debugLog(
+        current
+          ? "Chrome launch flags changed — restarting Chrome"
+          : "Restarting Chrome to align its launch flags"
+      );
+      status(current ? "Restarting Chrome to apply updated launch flags..." : "Restarting Chrome...");
+      await stopChrome();
+    } else if (chromeProcess) {
+      chromeProcess.kill();
+      chromeProcess = null;
+      await sleep(500);
+    }
 
-  await launchChrome(desired, status);
+    await launchChrome(desired, status);
+  });
+}
+
+/**
+ * Run a Chrome lifecycle operation (ensure/start/restart/stop) under a lock.
+ *
+ * The agent often issues several google_search / visit_page calls in one turn,
+ * and every call calls ensureChrome() first. Without serialization two calls
+ * could (a) spawn two Chrome processes on a cold start, or (b) both detect the
+ * same stale launch flags and each restart Chrome — the second killing the
+ * browser the first one had already opened and navigated a tab in, which shows
+ * up as a random "CDP call timeout" / connection error on the surviving call.
+ */
+function withChromeLifecycle<T>(fn: () => Promise<T>): Promise<T> {
+  const run = chromeLifecycle.then(fn, fn);
+  // Keep the chain alive regardless of this operation's outcome; the caller
+  // still observes the rejection through the returned promise.
+  chromeLifecycle = run.catch(() => undefined);
+  return run;
 }
 
 /** Stop the running Chrome (ours: signal it; started by another Pi session:
@@ -483,7 +550,9 @@ interface CDPTab {
 }
 
 async function getBrowserWSUrl(): Promise<string> {
-  const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`);
+  const resp = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`, {
+    signal: AbortSignal.timeout(CDP_HTTP_TIMEOUT_MS),
+  });
   const data = (await resp.json()) as { webSocketDebuggerUrl: string };
   return data.webSocketDebuggerUrl;
 }
@@ -508,7 +577,8 @@ async function openTab(): Promise<CDPTab> {
 async function closeTab(targetId: string): Promise<void> {
   try {
     await fetch(
-      `http://127.0.0.1:${CDP_PORT}/json/close/${encodeURIComponent(targetId)}`
+      `http://127.0.0.1:${CDP_PORT}/json/close/${encodeURIComponent(targetId)}`,
+      { signal: AbortSignal.timeout(CDP_HTTP_TIMEOUT_MS) }
     );
   } catch {
     // best effort
@@ -545,6 +615,54 @@ interface RunInPageOptions {
    *  (Network.enable is already called by this session). */
   resolveGoogleRedirects?: boolean;
   onStatus: (msg: string) => void;
+}
+
+/**
+ * Issue `Page.navigate`, retrying when the command itself times out.
+ *
+ * Two things make this more than a plain await:
+ *  - The page may finish loading while the command's reply is still stuck in
+ *    the browser — exactly what a slow proxy or a saturated network looks
+ *    like. The load event wins the race, so the call proceeds normally.
+ *  - A timeout is retried (up to NAVIGATE_ATTEMPTS). Errors that are *not*
+ *    timeouts — a closed CDP socket, a rejected command — are fatal and are
+ *    re-thrown immediately: retrying on a dead connection is pointless.
+ */
+async function navigateToPage(
+  cdp: CDPLike,
+  url: string,
+  pageLoaded: Promise<void>,
+  onStatus: StatusFn,
+): Promise<void> {
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= NAVIGATE_ATTEMPTS; attempt++) {
+    const outcome = cdp.call("Page.navigate", { url }, NAVIGATE_TIMEOUT_MS).then(
+      () => "done" as const,
+      (err: unknown) => {
+        const e = err instanceof Error ? err : new Error(String(err));
+        if (!/timeout/i.test(e.message)) throw e;
+        lastError = e;
+        return "timeout" as const;
+      },
+    );
+    // If we walk away because the page already loaded, a later rejection of
+    // this promise must not surface as an unhandled rejection.
+    outcome.catch(() => {});
+
+    const winner = await Promise.race([outcome, pageLoaded.then(() => "loaded" as const)]);
+    if (winner !== "timeout") return;
+
+    if (attempt < NAVIGATE_ATTEMPTS) {
+      onStatus(`Navigation is slow — retrying (${attempt + 1}/${NAVIGATE_ATTEMPTS})...`);
+      await sleep(500);
+    }
+  }
+
+  throw new Error(
+    `${lastError?.message ?? "CDP call timeout: Page.navigate"} ` +
+      `(after ${NAVIGATE_ATTEMPTS} attempts of ${NAVIGATE_TIMEOUT_MS / 1000}s — the page or the proxy may be slow)`,
+  );
 }
 
 /** Session logic: navigate, wait, scroll, extract — all against a connected
@@ -601,7 +719,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   let loadTimer!: ReturnType<typeof setTimeout>;
   const loadTimeout = new Promise<void>((resolve) => { loadTimer = setTimeout(resolve, 10_000); });
 
-  await cdp.call("Page.navigate", { url });
+  await navigateToPage(cdp, url, loaded, onStatus);
   await Promise.race([loaded, loadTimeout]);
   clearTimeout(loadTimer);
 
@@ -857,7 +975,7 @@ export async function visitPage(
 }
 
 export async function shutdownChrome(): Promise<void> {
-  await stopChrome();
+  await withChromeLifecycle(() => stopChrome());
 }
 
 // Exported for testing — internal API, not part of the extension's tool surface

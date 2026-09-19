@@ -289,6 +289,33 @@ Set `PI_SEARCH_DEBUG=1` to get the diagnostics back on stderr when
 troubleshooting (Chrome path, proxy flag, exit code, restart decisions). On
 Windows PowerShell: `$env:PI_SEARCH_DEBUG="1"; pi`.
 
+### Parallel tool calls
+
+Agents commonly issue several `google_search` / `visit_page` calls in one
+turn. They share the single visible Chrome window, which is intentional — but
+it used to be fragile, and a real session shows why: two parallel GitHub
+visits through a slow proxy took ~32s each, and the fixed 30s per-call CDP
+timeout failed one of them with `visit_page failed: CDP call timeout:
+Page.navigate`. Three things handle that now:
+
+- **`Page.navigate` is retried.** Each attempt gets 15s; after a timeout the
+  navigation is re-issued (up to 3 attempts). The command is idempotent for a
+  fixed URL, so a retry either picks up the load that already started or
+  restarts it. A page that finishes loading while the nav command's reply is
+  still stuck in the browser is accepted immediately — the load event wins.
+- **A dead CDP socket fails fast.** If Chrome exits or the tab/target crashes,
+  in-flight calls reject right away with `CDP connection closed` instead of
+  waiting out the 30s timeout and reporting a misleading navigation timeout.
+- **Chrome start/restart is serialized.** Cold-starting five parallel calls
+  launches exactly one Chrome (previously each could spawn its own), and two
+  calls that both detect stale launch flags no longer restart the browser out
+  from under each other.
+
+Only genuine stalls are retried: connection errors and rejected CDP commands
+propagate immediately. If a navigation still fails after all attempts, the
+error says so explicitly (`… after 3 attempts of 15s — the page or the proxy
+may be slow`), which is the signal to retry the tool call or check the proxy.
+
 ### `/browse` — subagent configuration
 
 `visit_page`'s `summary` mode uses a **subagent model** to read the page and
@@ -401,7 +428,7 @@ Six layers of tests (118 total):
 
 - **`tests/unit/urls.test.ts`** — table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - **`tests/unit/extractors-parse.test.ts`** — validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise).
+- **`tests/unit/cdp-client.test.ts`** — tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the **regression test for the v0.5.1 bug**: `cdp.evaluate()` stringifies return values, so `String(false)` → `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle → generic extractor fallback), HTTP error detection (4xx/5xx → `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
 - **`tests/unit/subagent.test.ts`** — tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, reasoning-param building (mirrors the vision tool), context-window truncation with token-budget reservation, and message construction. Also covers the browser proxy config: value normalization (`host:port` → `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls — `callSubagentModel` is exercised indirectly via its pure helpers.
 - **`tests/unit/tool-surface.test.ts`** — asserts the agent-facing `visit_page` text across all four `summaryEnabled` × `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled; no site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere; and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - **`tests/unit/google-links.test.ts`** — covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP — redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.
