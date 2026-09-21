@@ -59,6 +59,36 @@ const CDP_HTTP_TIMEOUT_MS = 3_000;
 export const NAVIGATE_TIMEOUT_MS = 15_000;
 export const NAVIGATE_ATTEMPTS = 3;
 
+/**
+ * Default wait for a bot-check interstitial to solve itself. These pages
+ * answer the first request with 403/503 (Cloudflare marks it
+ * `cf-mitigated: challenge`), run their challenge in the page and reload to
+ * the real document a few seconds later. Measured on a fresh profile through
+ * a proxy: 403 at ~3.2s, self-reload to 200 at ~7.6s. An ordinary browser
+ * never surfaces that first response — it only shows the final page.
+ */
+export const INTERSTITIAL_WAIT_MS = 15_000;
+/**
+ * After `Page.reload` on a non-challenge 403/503 (the F5 move), how long to
+ * wait for the retried document response before giving up.
+ */
+export const INTERSTITIAL_RELOAD_WAIT_MS = 8_000;
+const INTERSTITIAL_POLL_MS = 300;
+
+/**
+ * Text bot-check interstitials render in their title/body. Covers Cloudflare,
+ * DataDome, PerimeterX/HUMAN ("Access to this page has been denied"), Akamai,
+ * Imperva ("Request unsuccessful...") and generic "verify you are human"
+ * pages. Deliberately specific: a bare "Access Denied" auth page must not be
+ * mistaken for a solvable challenge.
+ */
+export const CHALLENGE_PAGE_RE =
+  /just a moment|attention required|checking (?:your browser|if the site)|verify (?:you are|you're|that you are) (?:a )?human|are you a robot|access to this page has been denied|request unsuccessful|enable javascript and cookies|ddos protection|under attack|incapsula|datadome|perimeterx|please wait while we (?:verify|check)/i;
+
+/** Probe evaluated on a 403/503 to tell a solvable interstitial from a plain
+ *  denial. Cheap (title + first 400 chars of visible text). */
+const CHALLENGE_PROBE_JS = `(document.title || "") + " " + (document.body ? document.body.innerText.slice(0, 400) : "")`;
+
 // ── Utilities ─────────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
@@ -597,6 +627,13 @@ interface RunInPageOptions {
   waitForTimeoutMs?: number;
   /** Poll interval for waitForSelector (ms). Default 400. */
   waitForSelectorPollMs?: number;
+  /** How long to wait for a bot-check interstitial (403/503) to clear itself.
+   *  0 disables the interstitial handling entirely (used by tests that pin the
+   *  plain HTTP-error path). Default INTERSTITIAL_WAIT_MS. */
+  interstitialWaitMs?: number;
+  /** How long to wait for the response to a `Page.reload` retry on a
+   *  non-challenge 403/503. Default INTERSTITIAL_RELOAD_WAIT_MS. */
+  interstitialReloadWaitMs?: number;
   /** Optional fallback JS to run in the SAME tab if the primary `js` returns
    *  an error marker or very short content. Avoids a second navigation when
    *  the primary extractor (e.g. Defuddle) fails on a page. */
@@ -665,6 +702,17 @@ async function navigateToPage(
   );
 }
 
+/** True when the committed 403/503 page is a solvable bot-check interstitial
+ *  (Cloudflare, DataDome, ...) rather than a plain denial. */
+async function looksLikeChallengePage(cdp: CDPLike): Promise<boolean> {
+  try {
+    const probe = await cdp.evaluate(CHALLENGE_PROBE_JS);
+    return CHALLENGE_PAGE_RE.test(probe);
+  } catch {
+    return false;
+  }
+}
+
 /** Session logic: navigate, wait, scroll, extract — all against a connected
  *  CDP client. Split out from runInPage so it can be tested with a fake
  *  CDPLike (no real Chrome, no WebSocket). */
@@ -680,6 +728,8 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     waitForSelector,
     waitForTimeoutMs = 8000,
     waitForSelectorPollMs = 400,
+    interstitialWaitMs = INTERSTITIAL_WAIT_MS,
+    interstitialReloadWaitMs = INTERSTITIAL_RELOAD_WAIT_MS,
     resolveGoogleRedirects = false,
     onStatus,
   } = opts;
@@ -687,31 +737,124 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   onStatus(`Navigating to ${new URL(url).hostname}...`);
 
   await cdp.call("Page.enable");
-  await cdp.call("Runtime.enable");
+  // Runtime.enable is deliberately NOT called: Runtime.evaluate works without
+  // it, and enabling the domain is a known CDP detection vector used by
+  // anti-bot scripts (they probe for its console-API side effects). Skipping
+  // it keeps the browser closer to an ordinary user's Chrome.
 
-  // Capture the main document's HTTP response status so we can surface 4xx/5xx
-  // errors (e.g. a 404 on a dead Cloudflare blog link) instead of silently
-  // extracting the error page's content. We listen for the FIRST Document-type
-  // response, which is the navigation itself (after any redirects).
-  //
-  // A const container (rather than a let variable) is used because TypeScript's
-  // control-flow analysis can't prove the onEvent closure actually ran, so a
-  // `let x = null` would stay narrowed to `null` at the check below. Mutating
-  // properties on a const object is tracked correctly through closures.
-  const docResponse = { status: 0, statusText: "" };
-  let gotDocResponse = false;
+  // Track every Document response, not just the first. Bot-check interstitials
+  // answer the initial request with 403/503, run their challenge in the page
+  // and reload to the real document — an ordinary browser never sees that
+  // first response. The frame id is recorded and matched against the main
+  // frame after the fact because `responseReceived` arrives before
+  // `Page.frameNavigated`; iframe Document responses (ad/user-sync pages) are
+  // filtered out by that match.
+  interface DocResponse {
+    status: number;
+    statusText: string;
+    url: string;
+    frameId?: string;
+    /** Cloudflare marks challenge interstitials with `cf-mitigated: challenge`. */
+    challenge: boolean;
+  }
+  const docResponses: DocResponse[] = [];
+  let mainFrameId: string | undefined;
+  let mainFrameUrl: string | undefined;
+  cdp.onEvent("Page.frameNavigated", (params) => {
+    const p = params as { frame?: { id?: string; parentId?: string; url?: string } };
+    if (p.frame && !p.frame.parentId) {
+      mainFrameId = p.frame.id;
+      mainFrameUrl = p.frame.url ?? mainFrameUrl;
+    }
+  });
   cdp.onEvent("Network.responseReceived", (params) => {
     const p = params as {
       type?: string;
-      response?: { url?: string; status?: number; statusText?: string };
+      frameId?: string;
+      response?: {
+        url?: string;
+        status?: number;
+        statusText?: string;
+        headers?: Record<string, string>;
+      };
     };
-    if (p.type === "Document" && p.response && !gotDocResponse) {
-      docResponse.status = p.response.status ?? 0;
-      docResponse.statusText = p.response.statusText ?? "";
-      gotDocResponse = true;
-    }
+    if (p.type !== "Document" || !p.response) return;
+    docResponses.push({
+      status: p.response.status ?? 0,
+      statusText: p.response.statusText ?? "",
+      url: p.response.url ?? "",
+      frameId: p.frameId,
+      challenge: String(p.response.headers?.["cf-mitigated"] ?? "").toLowerCase() === "challenge",
+    });
   });
   await cdp.call("Network.enable");
+
+  /** Latest Document response belonging to the main frame. Falls back to the
+   *  first response when no frame was ever captured (e.g. a fake CDP). */
+  const sameDoc = (r: DocResponse): boolean => {
+    if (mainFrameId !== undefined) return r.frameId === mainFrameId;
+    if (mainFrameUrl !== undefined) {
+      const norm = (u: string) => u.replace(/#.*$/, "").replace(/\/$/, "");
+      return norm(r.url) === norm(mainFrameUrl);
+    }
+    return true;
+  };
+  const latestMainDoc = (): DocResponse | undefined => {
+    for (let i = docResponses.length - 1; i >= 0; i--) {
+      if (sameDoc(docResponses[i])) return docResponses[i];
+    }
+    return docResponses[0];
+  };
+  const mainDocCount = (): number => docResponses.filter(sameDoc).length;
+
+  // Resolve a 403/503 the way a browser would. Challenge pages reload
+  // themselves once solved — the tab must stay open and alive for that (the
+  // old code closed it right away). Anything without challenge markers gets
+  // one reload, the F5 move.
+  const resolveInterstitial = async (): Promise<void> => {
+    const first = latestMainDoc();
+    if (!first || (first.status !== 403 && first.status !== 503)) return;
+
+    // Bot-check JS can be visibility-sensitive; activate the tab like a user
+    // opening the page would, even on paths that normally avoid focus theft.
+    try {
+      await cdp.call("Page.bringToFront");
+    } catch {
+      // Non-fatal: some targets reject it; the launch flags still help.
+    }
+
+    if (first.challenge || (await looksLikeChallengePage(cdp))) {
+      onStatus(`HTTP ${first.status} — waiting for the site's bot check to clear...`);
+      const deadline = Date.now() + interstitialWaitMs;
+      while (Date.now() < deadline) {
+        await sleep(INTERSTITIAL_POLL_MS);
+        const doc = latestMainDoc();
+        if (doc && doc.status < 400) {
+          onStatus("Bot check cleared — extracting...");
+          return;
+        }
+      }
+      return; // still blocked → error marker below
+    }
+
+    // No challenge markers: treat it as a stale first response (cookie wall,
+    // transient WAF rule, ...) and reload once, like a user pressing F5.
+    onStatus(`HTTP ${first.status} — retrying once...`);
+    const responsesBefore = mainDocCount();
+    try {
+      await cdp.call("Page.reload", { ignoreCache: false });
+    } catch {
+      return; // reload refused → report the original error
+    }
+    const deadline = Date.now() + interstitialReloadWaitMs;
+    while (Date.now() < deadline) {
+      await sleep(INTERSTITIAL_POLL_MS);
+      // As soon as the retry answers, its status decides (the check below).
+      // Count main-frame documents only: an ad iframe response must not make
+      // us give up while the main retry is still arriving.
+      if (mainDocCount() > responsesBefore) return;
+    }
+  };
 
   const loaded = new Promise<void>((resolve) => {
     cdp.onEvent("Page.loadEventFired", () => resolve());
@@ -723,13 +866,27 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   await Promise.race([loaded, loadTimeout]);
   clearTimeout(loadTimer);
 
-  // If the server returned an HTTP error (4xx/5xx), don't bother running the
-  // extractor on the error page — return a clear marker so visitPage can
-  // surface it to the LLM as an error result. This prevents the model from
-  // receiving "Page Not Found" gibberish as if it were page content.
-  if (gotDocResponse && docResponse.status >= 400) {
-    onStatus(`HTTP ${docResponse.status} ${docResponse.statusText}`.trim());
-    return `__HTTP_ERROR__: ${docResponse.status} ${docResponse.statusText}`.trim();
+  // A 403/503 from the first response is not final: it is usually a bot-check
+  // interstitial that clears itself seconds later. Wait for it (or retry once)
+  // before believing the error.
+  if (interstitialWaitMs > 0) {
+    await resolveInterstitial();
+  }
+
+  // If the server returned an HTTP error (4xx/5xx) that stuck, don't bother
+  // running the extractor on the error page — return a clear marker so
+  // visitPage can surface it to the LLM as an error result. This prevents the
+  // model from receiving "Page Not Found" gibberish as if it were content.
+  const finalDoc = latestMainDoc();
+  if (finalDoc && finalDoc.status >= 400) {
+    const challenge =
+      finalDoc.challenge ||
+      ((finalDoc.status === 403 || finalDoc.status === 503) && (await looksLikeChallengePage(cdp)));
+    const text = challenge
+      ? `${finalDoc.status} Bot challenge not passed`
+      : `${finalDoc.status} ${finalDoc.statusText}`.trim();
+    onStatus(`HTTP ${text}`);
+    return `__HTTP_ERROR__: ${text}`;
   }
 
   // Make this the active tab before any scrolling. Tool tabs open in the

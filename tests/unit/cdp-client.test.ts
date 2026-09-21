@@ -8,6 +8,19 @@ import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 // Implements CDPLike so runInPageSession can be exercised without a real
 // browser or WebSocket. Records every call/evaluate for assertions.
 
+interface FakeDocResponse {
+  status: number;
+  statusText?: string;
+  url?: string;
+  frameId?: string;
+  /** Emit the commit event as an iframe (parentId set) instead of the main frame. */
+  iframe?: boolean;
+  /** Mark the response as a Cloudflare challenge (`cf-mitigated: challenge`). */
+  challenge?: boolean;
+  /** Emit this response after a delay (settles in the background). */
+  delayMs?: number;
+}
+
 class FakeCDP implements CDPLike {
   calls: Array<{ method: string; params?: Record<string, unknown>; timeoutMs?: number }> = [];
   evaluations: string[] = [];
@@ -21,9 +34,21 @@ class FakeCDP implements CDPLike {
   extractionResult = "extracted content";
   /** HTTP status to simulate for the main document response. Set before
    *  calling runInPageSession to make Page.navigate emit a
-   *  Network.responseReceived event with this status. 0 = don't emit. */
+   *  Network.responseReceived event with this status. 0 = don't emit.
+   *  Ignored when `docSequence` is non-empty. */
   docResponseStatus = 0;
   docResponseStatusText = "";
+  /** Document responses emitted for Page.navigate, in order. Use for
+   *  interstitials (403 then 200) and iframe filtering; `delayMs` simulates a
+   *  response that arrives after the challenge solved itself. */
+  docSequence: FakeDocResponse[] = [];
+  /** Document responses emitted for Page.reload (same shape as docSequence). */
+  reloadSequence: FakeDocResponse[] = [];
+  /** Main-frame id attached to sequence entries that don't set `frameId`. */
+  mainFrameId = "F-MAIN";
+  /** Value returned by the challenge probe (document.title ...). Empty means
+   *  "not a challenge page". */
+  titleProbeText = "";
   /** How many upcoming Page.navigate calls fail with a timeout (simulates a
    *  stalled browser/proxy). Set before runInPageSession. */
   navigateTimeouts = 0;
@@ -34,6 +59,32 @@ class FakeCDP implements CDPLike {
   navigateHangs = false;
   private loadHandlers: Array<(params: unknown) => void> = [];
   private networkHandlers: Array<(params: unknown) => void> = [];
+  private frameHandlers: Array<(params: unknown) => void> = [];
+  /** URL of the last Page.navigate, used when a sequence entry omits `url`. */
+  private lastNavigateUrl = "https://example.com/page";
+
+  /** Emit one Document response plus the commit that follows it (real CDP
+   *  order: Network.responseReceived → Page.frameNavigated). */
+  private emitDocResponse(spec: FakeDocResponse, url: string): void {
+    const frameId = spec.frameId ?? this.mainFrameId;
+    const responseUrl = spec.url ?? url;
+    for (const h of this.networkHandlers) {
+      h({
+        type: "Document",
+        frameId,
+        response: {
+          url: responseUrl,
+          status: spec.status,
+          statusText: spec.statusText ?? "",
+          mimeType: "text/html",
+          headers: spec.challenge ? { "cf-mitigated": "challenge" } : {},
+        },
+      });
+    }
+    for (const h of this.frameHandlers) {
+      h({ frame: { id: frameId, parentId: spec.iframe ? this.mainFrameId : undefined, url: responseUrl } });
+    }
+  }
 
   async call(
     method: string,
@@ -41,29 +92,36 @@ class FakeCDP implements CDPLike {
     timeoutMs?: number,
   ): Promise<unknown> {
     this.calls.push({ method, params, timeoutMs });
-    if (method === "Page.navigate") {
-      if (this.navigateTimeouts > 0) {
-        this.navigateTimeouts--;
-        throw new Error(this.navigateTimeoutMessage);
+    if (method === "Page.navigate" || method === "Page.reload") {
+      if (method === "Page.navigate") {
+        if (this.navigateTimeouts > 0) {
+          this.navigateTimeouts--;
+          throw new Error(this.navigateTimeoutMessage);
+        }
+        this.lastNavigateUrl = String(params.url ?? this.lastNavigateUrl);
       }
-      // Emit the document's Network.responseReceived event BEFORE load
-      // (mirrors real CDP ordering: response received → load event fires).
-      if (this.docResponseStatus > 0) {
-        for (const h of this.networkHandlers) {
-          h({
-            type: "Document",
-            response: {
-              url: params.url,
-              status: this.docResponseStatus,
-              statusText: this.docResponseStatusText,
-              mimeType: "text/html",
-            },
-          });
+      const specs = method === "Page.navigate"
+        ? (this.docSequence.length > 0
+            ? this.docSequence
+            : this.docResponseStatus > 0
+              ? [{ status: this.docResponseStatus, statusText: this.docResponseStatusText }]
+              : [])
+        : this.reloadSequence;
+      const url = method === "Page.navigate" ? String(params.url ?? "") : this.lastNavigateUrl;
+      // Emit response events BEFORE the load event (real CDP ordering).
+      for (const spec of specs) {
+        if (spec.delayMs && spec.delayMs > 0) {
+          setTimeout(() => this.emitDocResponse(spec, url), spec.delayMs);
+        } else {
+          this.emitDocResponse(spec, url);
         }
       }
-      // Fire load handlers synchronously (registered before navigate).
-      for (const h of this.loadHandlers) h({});
-      if (this.navigateHangs) return new Promise<never>(() => {});
+      if (method === "Page.navigate") {
+        // Fire load handlers synchronously (registered before navigate).
+        for (const h of this.loadHandlers) h({});
+        if (this.navigateHangs) return new Promise<never>(() => {});
+      }
+      return {};
     }
     return {};
   }
@@ -75,6 +133,10 @@ class FakeCDP implements CDPLike {
     if (expression.startsWith("document.querySelector")) {
       return this.selectorFound ? "true" : "false";
     }
+    // Challenge probe: (document.title || "") + " " + body text.
+    if (expression.includes("document.title")) {
+      return this.titleProbeText;
+    }
     if (this.evaluateResults.has(expression)) {
       return this.evaluateResults.get(expression)!;
     }
@@ -84,6 +146,7 @@ class FakeCDP implements CDPLike {
   onEvent(method: string, handler: (params: unknown) => void): void {
     if (method === "Page.loadEventFired") this.loadHandlers.push(handler);
     if (method === "Network.responseReceived") this.networkHandlers.push(handler);
+    if (method === "Page.frameNavigated") this.frameHandlers.push(handler);
   }
 
   disconnect(): void {}
@@ -164,15 +227,18 @@ test("waitForSelector times out (and keeps polling) when selector never appears"
 
 // ── Navigation & extraction ────────────────────────────────────────────────
 
-test("navigation calls Page.enable, Runtime.enable, Network.enable, Page.navigate in order", async () => {
+test("navigation enables Page + Network (never Runtime) and then navigates", async () => {
   const fake = new FakeCDP();
   await runInPageSession(fake, baseOpts());
 
   const methods = fake.calls.map((c) => c.method);
   assert.deepEqual(
-    methods.slice(0, 4),
-    ["Page.enable", "Runtime.enable", "Network.enable", "Page.navigate"],
+    methods.slice(0, 3),
+    ["Page.enable", "Network.enable", "Page.navigate"],
   );
+  // Runtime.enable is a known CDP fingerprint used by anti-bot scripts;
+  // Runtime.evaluate works without it, so it must never be enabled.
+  assert.ok(!methods.includes("Runtime.enable"), "Runtime.enable must not be called");
   const nav = fake.calls.find((c) => c.method === "Page.navigate");
   assert.equal(nav?.params?.url, "https://example.com/page");
 });
@@ -409,8 +475,8 @@ test("returns __HTTP_ERROR__ marker when server responds 404", async () => {
 
 test("HTTP error skips extraction entirely (no wasted JS evaluation)", async () => {
   const fake = new FakeCDP();
-  fake.docResponseStatus = 403;
-  fake.docResponseStatusText = "Forbidden";
+  fake.docResponseStatus = 404;
+  fake.docResponseStatusText = "Not Found";
 
   await runInPageSession(fake, baseOpts({
     js: "myExtractor()",
@@ -450,7 +516,7 @@ test("5xx server errors are also surfaced", async () => {
   fake.docResponseStatus = 503;
   fake.docResponseStatusText = "Service Unavailable";
 
-  const result = await runInPageSession(fake, baseOpts());
+  const result = await runInPageSession(fake, baseOpts({ interstitialWaitMs: 0 }));
   assert.ok(result.startsWith("__HTTP_ERROR__: 503"), `expected 503 marker, got: ${result}`);
 });
 
@@ -481,20 +547,114 @@ test("no Network.responseReceived (status 0) proceeds normally", async () => {
   assert.equal(result, "content from page", "should extract normally when no status captured");
 });
 
-test("only the first Document response is captured (redirects use final status)", async () => {
-  // If there's a redirect, the first Document response might be a 301/302.
-  // We capture the FIRST one — but in practice CDP fires responseReceived for
-  // the redirect with type 'Other', and the final document with type 'Document'.
-  // This test confirms a non-Document response doesn't set the status.
+test("an iframe Document 403 does not override the main document's 200", async () => {
+  // Ad/user-sync iframes also emit Document responses; the status filter must
+  // follow the main frame, not "any Document response".
   const fake = new FakeCDP();
-  // Emit a non-Document (e.g. image) 404 response — should be ignored.
-  fake.docResponseStatus = 0; // no Document response
+  fake.docSequence = [
+    { status: 200, statusText: "OK" },
+    { status: 403, statusText: "Forbidden", frameId: "F-AD", iframe: true },
+  ];
+  fake.evaluateResults.set("myExtractor()", "main page content, long enough to keep");
+
+  const result = await runInPageSession(fake, baseOpts({ js: "myExtractor()" }));
+
+  assert.equal(result, "main page content, long enough to keep");
+});
+
+// ── Bot-check interstitials (403/503 that clear themselves) ───────────────
+// A fresh profile hitting a Cloudflare-protected site answered 403
+// (`cf-mitigated: challenge`) at ~3.2s and reloaded with 200 at ~7.6s. The
+// old code captured that first 403, returned an error and closed the tab —
+// killing the challenge that was about to solve itself. These tests pin the
+// browser-like behavior: wait for the self-reload, or reload once.
+
+test("403 challenge that clears itself proceeds with extraction (regression)", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [
+    { status: 403, statusText: "Forbidden", challenge: true },
+    { status: 200, statusText: "OK", delayMs: 150 },
+  ];
+  fake.evaluateResults.set("myExtractor()", "real article content, long enough to keep");
+
+  const statuses: string[] = [];
+  const result = await runInPageSession(fake, baseOpts({
+    js: "myExtractor()",
+    interstitialWaitMs: 2_000,
+    onStatus: (m) => statuses.push(m),
+  }));
+
+  assert.equal(result, "real article content, long enough to keep");
+  assert.ok(
+    statuses.some((s) => s.includes("bot check")),
+    `the user should see the challenge wait: ${statuses.join(" | ")}`,
+  );
+  assert.ok(
+    fake.calls.some((c) => c.method === "Page.bringToFront"),
+    "the tab should be activated so the challenge JS runs",
+  );
+});
+
+test("challenge that never clears returns a challenge-specific error marker", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 403, statusText: "Forbidden", challenge: true }];
 
   const result = await runInPageSession(fake, baseOpts({
     js: "myExtractor()",
+    interstitialWaitMs: 300,
   }));
 
-  assert.equal(result, "extracted content", "non-Document 404s should not trigger the error path");
+  assert.ok(result.startsWith("__HTTP_ERROR__: 403"), `expected 403 marker, got: ${result}`);
+  assert.ok(result.includes("Bot challenge not passed"), `should identify the challenge: ${result}`);
+  assert.ok(!fake.evaluations.includes("myExtractor()"), "extractor must not run on a blocked page");
+});
+
+test("non-challenge 403 triggers exactly one reload and uses the retry's status", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 403, statusText: "Forbidden" }];
+  fake.titleProbeText = "Forbidden"; // not a challenge page
+  fake.reloadSequence = [{ status: 200, statusText: "OK", delayMs: 100 }];
+  fake.evaluateResults.set("myExtractor()", "content after the reload, long enough to keep");
+
+  const result = await runInPageSession(fake, baseOpts({
+    js: "myExtractor()",
+    interstitialWaitMs: 2_000,
+    interstitialReloadWaitMs: 1_000,
+  }));
+
+  assert.equal(result, "content after the reload, long enough to keep");
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Page.reload").length,
+    1,
+    "exactly one reload",
+  );
+});
+
+test("persistent non-challenge 403 still reports the plain error after the reload", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 403, statusText: "Forbidden" }];
+  fake.titleProbeText = "Forbidden";
+  fake.reloadSequence = [{ status: 403, statusText: "Forbidden", delayMs: 100 }];
+
+  const result = await runInPageSession(fake, baseOpts({
+    js: "myExtractor()",
+    interstitialWaitMs: 2_000,
+    interstitialReloadWaitMs: 1_000,
+  }));
+
+  assert.equal(fake.calls.filter((c) => c.method === "Page.reload").length, 1);
+  assert.ok(result.startsWith("__HTTP_ERROR__: 403 Forbidden"), `got: ${result}`);
+});
+
+test("a 404 is final immediately (no reload, no wasted evaluations)", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 404, statusText: "Not Found" }];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "myExtractor()" }));
+
+  assert.ok(result.startsWith("__HTTP_ERROR__: 404"), `got: ${result}`);
+  assert.equal(fake.calls.filter((c) => c.method === "Page.reload").length, 0);
+  assert.equal(fake.evaluations.length, 0, "404 must not probe or reload");
 });
 
 // ── No stderr noise in the TUI ────────────────────────────────────────────
@@ -608,7 +768,7 @@ test("Page.navigate passes the short timeout, other calls keep the default", asy
 
   const navigate = fake.calls.find((c) => c.method === "Page.navigate");
   assert.equal(navigate?.timeoutMs, NAVIGATE_TIMEOUT_MS);
-  const evaluate = fake.calls.find((c) => c.method === "Runtime.enable");
+  const evaluate = fake.calls.find((c) => c.method === "Network.enable");
   assert.equal(evaluate?.timeoutMs, undefined, "non-navigate calls use the client default");
 });
 

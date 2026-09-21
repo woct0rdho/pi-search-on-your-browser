@@ -8,7 +8,7 @@ Search Google and browse the web in your **own visible Chrome browser** — no A
 - **`visit_page`** fetches any URL as markdown using your visible Chrome (authenticated everywhere — paywalled sites, X, Reddit, Amazon, GitHub)
 - **`clean` extraction** — reader-mode markdown via [Defuddle](https://github.com/kepano/defuddle) (the Obsidian Web Clipper library); drops nav/sidebars/ads, ~47% fewer tokens on docs pages
 - **`summary` subagent** — pass `summary: true`, get only a concise summary of the whole page back (the full page never enters your chat context); reuses your current Pi model by default, **no setup needed**
-- **HTTP error detection** — dead links return a clear `isError` with status-specific hints instead of error-page gibberish
+- **HTTP error detection** — dead links return a clear `isError` with status-specific hints instead of error-page gibberish; bot-check 403s are waited out like a real browser
 - **Site-specific extractors** — X/Twitter (structured tweets), Reddit (posts + threaded comments), Amazon (products + search), Google Scholar (papers)
 - **Zero API keys, zero runtime npm dependencies** — uses your existing browser; nothing to sign up for
 
@@ -244,12 +244,27 @@ again, rather than receiving "Page Not Found" gibberish as if it were page
 content. The collapsed tool result shows the status code, e.g.
 `→ HTTP 404 · 1.2s · blog.cloudflare.com`.
 
+**Bot-check interstitials are handled like a real browser.** Cloudflare (and
+DataDome, PerimeterX, Akamai, Imperva) answer the first request with **403/503**
+(Cloudflare marks it `cf-mitigated: challenge`), run a JavaScript challenge in
+the page and reload to the real document a few seconds later — an ordinary
+browser never shows the user that first response. `visit_page` now tracks every
+document response per frame (an ad/iframe `Document` response cannot mask the
+main page), keeps the tab open on a 403/503, activates it, and waits up to 15s
+for the self-reload before believing the error. A 403/503 *without* challenge
+markers gets one `Page.reload` retry instead (the F5 move). If the challenge
+still does not clear, the result is `HTTP 403 Bot challenge not passed` with a
+hint to open the visible Chrome window — the clearance cookie it obtains stays
+in the profile, so the next attempt succeeds. The tool also no longer enables
+the CDP `Runtime` domain: `Runtime.evaluate` works without it, and enabling it
+is a known fingerprint that anti-bot scripts probe for.
+
 Status-specific hints:
 
 | Status | Hint |
 |---|---|
 | **404** | Page doesn't exist — try a different URL or search |
-| **403** | Access denied — may be bot protection, auth, or paywall |
+| **403** | Access denied or an unresolved bot check — the visible Chrome window can clear it, then retry |
 | **429** | Rate limited — wait and retry |
 | **5xx** | Server error — retry shortly or try a different URL |
 
@@ -460,6 +475,7 @@ The project uses `node:test` + `node:assert/strict` (built into Node.js) and nat
 
 ### v0.8.1
 
+- **Fix: a Cloudflare-style bot check (HTTP 403) was reported as a dead page.** `visit_page` treated the first document response as final, but bot-check interstitials answer the first request with **403** (`cf-mitigated: challenge`), run their challenge in the page and reload to the real document a few seconds later — measured on a fresh profile through a proxy: 403 at ~3.2s, 200 at ~7.6s. The tool returned `HTTP 403` and closed the tab before the challenge could finish (a real session log shows exactly this on a superuser.com question). Now every Document response is tracked per frame (ad/iframe responses cannot mask the main page), a 403/503 keeps the tab open, activates it and waits up to 15s for the self-reload, and a 403/503 without challenge markers gets one reload retry instead. An unresolved challenge returns a distinct `403 Bot challenge not passed` with a hint that the visible Chrome window can clear it (the clearance cookie persists in the profile). `Runtime.enable` was also dropped: `Runtime.evaluate` does not need it, and enabling the domain is a known CDP fingerprint probed by anti-bot scripts. New tests (128 total) cover the self-solving challenge, the persistent challenge, the reload retry, iframe filtering, and the immediate-404 path. Verified end-to-end against a fresh Chrome profile through the proxy: `waiting for the site's bot check to clear...` → `Bot check cleared — extracting...` → the real page title, where the old code returned `HTTP 403`.
 - **Fix: `google_search` crashed the whole Pi process with `spawn google-chrome ENOENT` on Windows.** `findChrome()` only knew Linux/macOS install paths, so on Windows it fell through to the bare name `google-chrome` — which does not exist — and the resulting `spawn` `error` event had no listener, so Node re-threw it as an `uncaughtException` and Pi exited. Browser discovery now probes the real Windows locations (`%LOCALAPPDATA%\Google\Chrome`, `%PROGRAMFILES%`, `%PROGRAMFILES(x86)%`, Chromium), prefers `CHROME_PATH`, falls back to Edge (Chromium-based, same CDP flags), and `launchChrome()` attaches an `error` listener that turns a failed launch into a normal, actionable tool error (`Could not launch browser "…": … set CHROME_PATH …`) instead of killing the session.
 - **New: proxy support for the Chrome browser.** Set `browser.proxy` in `~/.pi/agent/search-on-your-browser.json` (or `PI_SEARCH_PROXY`, or `/browse proxy <url|off>`) and Chrome is launched with `--proxy-server=<value>` — every request it makes, including CDP-driven navigations, goes through the proxy, so `google_search`/`visit_page` work on machines without a direct route to the internet. Accepts `http://`, `https://`, `socks4://`, `socks5://` URLs (with or without credentials) and bare `host:port` (defaults to `http://`); empty/`off`/`none`/`direct` means a direct connection. `/browse` now reports the effective proxy. Verified end-to-end: Google search + `visit_page` through `http://127.0.0.1:8010`, plus an automatic Chrome restart when the proxy is changed.
 - **Chrome launch flags are now auto-detected instead of requiring a manual relaunch after upgrading.** The flags the live Chrome was started with are recorded in `~/.pi-search-browser/.pi-launch-args.json`; on the next tool call a mismatch (an upgrade that changed the flags, or a proxy added/removed/changed) is detected and the tool's Chrome restarted automatically. `shutdownChrome()` now also closes a Chrome started by an earlier Pi session (CDP `Browser.close`), not just its own child process. 12 new tests (83 total) cover browser discovery, the proxy launch flag, config precedence (file > env > direct), tolerant parsing, the saved config shape, the `/browse` summary line, and the actionability of the spawn-error message.

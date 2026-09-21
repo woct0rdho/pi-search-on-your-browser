@@ -250,7 +250,10 @@ function visitPageToolDefinition() {
         if (code === 404) {
           hint = "The page does not exist at this URL — the content may have been moved, removed, or the URL may be incorrect. Try a different URL or search for the content.";
         } else if (code === 403) {
-          hint = "Access was denied — the site may be blocking automated access, require authentication, or be behind a paywall.";
+          const isChallenge = /challenge|bot|captcha|cloudflare|datadome|perimeterx|incapsula/i.test(reason);
+          hint = isChallenge
+            ? "The site served a bot check that did not clear automatically. The tool's Chrome window is visible — open or refresh this URL there (click the check if one appears), then retry; the clearance is stored in the browser profile."
+            : "Access was denied — the site may be blocking automated access, require authentication, or be behind a paywall. The tool's Chrome window is visible: open this URL there to log in or clear any check, then retry.";
         } else if (code === 429) {
           hint = "Rate limited — too many requests. Wait a moment and retry.";
         } else if (code >= 500) {
