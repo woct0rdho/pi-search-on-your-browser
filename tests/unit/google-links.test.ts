@@ -11,7 +11,7 @@ import {
 // Google result links now use `/goto?url=<Tink-encrypted token>`, which cannot
 // be decoded offline; the direct URL only comes back when the 302 is followed.
 // These tests cover the pure parsing/replacement plus the CDP-driven resolver
-// (with a fake CDP client — no browser, no network).
+// (with a fake CDP client - no browser, no network).
 
 const GOTO = "https://www.google.com/goto?url=CAESabcDEF";
 const URL_Q = "https://www.google.es/url?q=https%3A%2F%2Fexample.com%2Fpage&sa=U";
@@ -74,19 +74,17 @@ test("replaceGoogleRedirects: no-op with an empty map", () => {
   assert.equal(replaceGoogleRedirects(markdown, new Map()), markdown);
 });
 
-/** One redirect hop: wrapper → destination, optionally via a Location header. */
+// One redirect hop: wrapper -> destination, optionally via a Location header.
 interface RedirectHop {
   from: string;
   to: string;
-  /** When set, the resolver should prefer this over `to` (header path). */
+  // When set, the resolver should prefer this over `to` (header path).
   location?: string;
 }
 
-/**
- * Fake CDP. The first `evaluate` (the fetch trigger) emits the prepared
- * `Network.requestWillBeSent` redirect events; later calls (the abort script)
- * emit nothing.
- */
+// Fake CDP. The first `evaluate` (the fetch trigger) emits the prepared
+// `Network.requestWillBeSent` redirect events; later calls (the abort script)
+// emit nothing.
 function fakeCdp(hops: RedirectHop[] = []) {
   const handlers = new Map<string, Array<(params: unknown) => void>>();
   const cdp: GoogleRedirectCdp & { evaluated: string[] } = {
@@ -143,7 +141,7 @@ test("resolveGoogleRedirectsInBrowser: prefers the Location header when present"
   assert.ok(out.includes("- [A](https://www.google.com/sorry/index)"), out);
 });
 
-test("resolveGoogleRedirectsInBrowser: no redirect links → no page evaluation", async () => {
+test("resolveGoogleRedirectsInBrowser: no redirect links -> no page evaluation", async () => {
   const cdp = fakeCdp([]);
   const markdown = "- [A](https://example.com/direct)";
   const out = await resolveGoogleRedirectsInBrowser(cdp, markdown);
@@ -162,7 +160,7 @@ test("resolveGoogleRedirectsInBrowser: keeps unresolved links and reports them",
     onStatus: (msg) => statuses.push(msg),
   });
 
-  assert.equal(out, `- [A](${GOTO})`, "the /goto link is still visitable — never dropped");
+  assert.equal(out, `- [A](${GOTO})`, "the /goto link is still visitable - never dropped");
   assert.ok(statuses.some((s) => s.includes("could not be resolved")), statuses.join(" | "));
 });
 

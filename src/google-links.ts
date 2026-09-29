@@ -1,39 +1,37 @@
-/**
- * Google search-result redirect resolution.
- *
- * Google rewrites some result links to `https://www.google.com/goto?url=<opaque>`
- * — a Tink-encrypted protobuf that cannot be decoded offline (no encoder key,
- * no plaintext URL inside). The classic `google.com/url?q=<target>` wrapper
- * still appears for signed-out users and is unwrapped for free by the
- * extractor JS; `/goto` links are kept as-is so they can be resolved here.
- *
- * The one reliable way to reveal a `/goto` target is to ask Google: the
- * endpoint answers HTTP 302 with the destination in the `Location` header
- * (verified). The request must go through the same Chrome as the search (the
- * extension's Chrome has the configured proxy and cookies), so the links are
- * fetched *inside the open SERP tab* — JavaScript gets only an opaque response
- * and cannot read the redirect, but the CDP client observes the network. Each
- * fetch follows the 302 (`redirect: "follow"`); the follow-up request event
- * carries the previous hop in `redirectResponse` (a `Network.Response`, whose
- * `url` is the wrapper) and the direct destination in `request.url`. Chrome
- * does not emit `responseReceived` for a manual redirect, which is why the
- * chain has to be walked for real. The destination downloads are aborted once
- * the chain has been observed.
- *
- * Resolution is best-effort: links whose Location is not captured within the
- * timeout are left as the original `/goto` URL (still visitable — Chrome
- * follows the 302), never dropped.
- *
- * This module is free of `@earendil-works/*` imports so it type-checks under
- * the src/-scoped tsconfig; chrome.ts passes its CDP client in structurally.
- */
+// Google search-result redirect resolution.
+//
+// Google rewrites some result links to `https://www.google.com/goto?url=<opaque>`
+// - a Tink-encrypted protobuf that cannot be decoded offline (no encoder key,
+// no plaintext URL inside). The classic `google.com/url?q=<target>` wrapper
+// still appears for signed-out users and is unwrapped for free by the
+// extractor JS; `/goto` links are kept as-is so they can be resolved here.
+//
+// The one reliable way to reveal a `/goto` target is to ask Google: the
+// endpoint answers HTTP 302 with the destination in the `Location` header
+// (verified). The request must go through the same Chrome as the search (the
+// extension's Chrome has the configured proxy and cookies), so the links are
+// fetched *inside the open SERP tab* - JavaScript gets only an opaque response
+// and cannot read the redirect, but the CDP client observes the network. Each
+// fetch follows the 302 (`redirect: "follow"`); the follow-up request event
+// carries the previous hop in `redirectResponse` (a `Network.Response`, whose
+// `url` is the wrapper) and the direct destination in `request.url`. Chrome
+// does not emit `responseReceived` for a manual redirect, which is why the
+// chain has to be walked for real. The destination downloads are aborted once
+// the chain has been observed.
+//
+// Resolution is best-effort: links whose Location is not captured within the
+// timeout are left as the original `/goto` URL (still visitable - Chrome
+// follows the 302), never dropped.
+//
+// This module is free of `@earendil-works/*` imports so it type-checks under
+// the src/-scoped tsconfig; chrome.ts passes its CDP client in structurally.
 
-/** Matches the Google host of a redirect wrapper (www.google.com, google.es, ...). */
+// Matches the Google host of a redirect wrapper (www.google.com, google.es, ...).
 const GOOGLE_HOST_RE = /(^|\.)google\./;
-/** Matches the redirect endpoint paths: /url and /goto (with optional trailing slash). */
+// Matches the redirect endpoint paths: /url and /goto (with optional trailing slash).
 const GOOGLE_REDIRECT_PATH_RE = /^\/(url|goto)\/?$/;
 
-/** True when `raw` is a Google redirect wrapper (`/url?...` or `/goto?...`). */
+// True when `raw` is a Google redirect wrapper (`/url?...` or `/goto?...`).
 export function isGoogleRedirectUrl(raw: string): boolean {
   try {
     const u = new URL(raw);
@@ -43,10 +41,10 @@ export function isGoogleRedirectUrl(raw: string): boolean {
   }
 }
 
-/** Markdown links as emitted by the extractor: `[text](https://...)`. */
+// Markdown links as emitted by the extractor: `[text](https://...)`.
 const MARKDOWN_LINK_RE = /\]\((https?:\/\/[^()\s]+)\)/g;
 
-/** Unique Google redirect URLs referenced by markdown links, in first-seen order. */
+// Unique Google redirect URLs referenced by markdown links, in first-seen order.
 export function findGoogleRedirectUrls(markdown: string): string[] {
   const seen = new Set<string>();
   const urls: string[] = [];
@@ -59,8 +57,8 @@ export function findGoogleRedirectUrls(markdown: string): string[] {
   return urls;
 }
 
-/** Replace markdown link URLs that have a resolved destination. Unmapped URLs
- *  are left untouched. */
+// Replace markdown link URLs that have a resolved destination. Unmapped URLs
+// are left untouched.
 export function replaceGoogleRedirects(
   markdown: string,
   resolved: ReadonlyMap<string, string>,
@@ -72,7 +70,7 @@ export function replaceGoogleRedirects(
   });
 }
 
-/** The subset of the CDP client this module needs (chrome.ts's CDPClient fits). */
+// The subset of the CDP client this module needs (chrome.ts's CDPClient fits).
 export interface GoogleRedirectCdp {
   evaluate(expression: string): Promise<string>;
   onEvent(method: string, handler: (params: unknown) => void): void;
@@ -80,17 +78,17 @@ export interface GoogleRedirectCdp {
 
 export interface ResolveGoogleRedirectsOptions {
   onStatus?: (msg: string) => void;
-  /** How long to wait for the Location headers. Default 8000ms. */
+  // How long to wait for the Location headers. Default 8000ms.
   timeoutMs?: number;
-  /** Poll interval while waiting. Default 100ms. */
+  // Poll interval while waiting. Default 100ms.
   pollMs?: number;
-  /** Injectable sleep, for tests. */
+  // Injectable sleep, for tests.
   sleep?: (ms: number) => Promise<void>;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Case-insensitive header lookup (CDP returns HTTP/1.1 casing over HTTP/2 lowercase). */
+// Case-insensitive header lookup (CDP returns HTTP/1.1 casing over HTTP/2 lowercase).
 function headerValue(headers: Record<string, unknown> | undefined, name: string): string | undefined {
   if (!headers) return undefined;
   const wanted = name.toLowerCase();
@@ -102,11 +100,9 @@ function headerValue(headers: Record<string, unknown> | undefined, name: string)
   return undefined;
 }
 
-/**
- * Resolve every Google redirect link in `markdown` through the page the CDP
- * client is attached to, returning markdown with direct URLs where possible.
- * Best-effort: unresolved links keep their original redirect URL.
- */
+// Resolve every Google redirect link in `markdown` through the page the CDP
+// client is attached to, returning markdown with direct URLs where possible.
+// Best-effort: unresolved links keep their original redirect URL.
 export async function resolveGoogleRedirectsInBrowser(
   cdp: GoogleRedirectCdp,
   markdown: string,
@@ -121,9 +117,9 @@ export async function resolveGoogleRedirectsInBrowser(
 
   // Chrome follows the 302; the follow-up request carries the previous hop in
   // `redirectResponse` (whose `url` is the redirect wrapper) and the direct
-  // destination in `request.url`. Manual redirects are invisible here — Chrome
+  // destination in `request.url`. Manual redirects are invisible here - Chrome
   // delivers them to the renderer as opaque responses with no
-  // `responseReceived` event — so the chain has to be walked for real.
+  // `responseReceived` event - so the chain has to be walked for real.
   cdp.onEvent("Network.requestWillBeSent", (params) => {
     const p = params as {
       request?: { url?: string };

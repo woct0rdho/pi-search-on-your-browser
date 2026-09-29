@@ -1,84 +1,66 @@
-/**
- * Subagent — delegates page-content Q&A to a text model.
- *
- * Mirrors the vision-tool extension's approach: a model is resolved from Pi's
- * registry and called via a direct OpenAI-compatible /chat/completions request
- * using Pi's already-configured auth (no separate API keys). By default the
- * subagent reuses the current session model (ctx.model); an explicit
- * provider/model can be pinned via /browse to use a cheaper/faster model.
- *
- * Only the model's answer comes back to the chat context — the full page
- * markdown is consumed by the subagent internally but never enters the
- * conversation. This keeps visit_page results small when `summary` is used.
- *
- * This module is deliberately free of `@earendil-works/*` imports so it stays
- * type-checkable under `tsc --noEmit` (which only resolves Node built-ins for
- * src/). The real `Model<Api>` from the registry is structurally compatible
- * with `SubagentModel` and is passed in from index.ts.
- *
- * Config is persisted to <agent-dir>/search-on-your-browser.json (set via
- * setConfigDir(getAgentDir()) on session_start) and managed via /browse.
- *
- * Env-var fallbacks (optional overrides; else current model is used):
- * PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
- * PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED,
- * PI_BROWSE_CLEAN_ENABLED.
- *
- * `summaryEnabled` and `cleanEnabled` select whether `visit_page` offers its
- * `summary` / `clean` options at all (they never disable the tool itself).
- *
- * The same file also configures the browser itself (proxy), written as
- * `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
- * it when the file does not set one.
- */
+// Subagent - delegates page-content summarization to a text model.
+//
+// A model is resolved from Pi's registry and called through Pi's
+// provider-neutral stream API with Pi's already-configured auth (no separate
+// API keys). By default the subagent reuses the current session model
+// (ctx.model); an explicit provider/model can be pinned via /browse to use a
+// cheaper/faster model. This module owns the config, the summary prompt, and
+// context truncation - the model call itself lives in index.ts, next to the
+// registry.
+//
+// Only the model's answer comes back to the chat context - the full page
+// markdown is consumed by the subagent internally but never enters the
+// conversation. This keeps visit_page results small when `summary` is used.
+//
+// This module is deliberately free of `@earendil-works/*` imports so it stays
+// type-checkable under `tsc --noEmit` (which only resolves Node built-ins for
+// src/).
+//
+// Config is persisted to <agent-dir>/search-on-your-browser.json (set via
+// setConfigDir(getAgentDir()) on session_start) and managed via /browse.
+//
+// Env-var fallbacks (optional overrides; else current model is used):
+// PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
+// PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED,
+// PI_BROWSE_CLEAN_ENABLED.
+//
+// `summaryEnabled` and `cleanEnabled` select whether `visit_page` offers its
+// `summary` / `clean` options at all (they never disable the tool itself).
+//
+// The same file also configures the browser itself (proxy), written as
+// `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
+// it when the file does not set one.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-// ---------------------------------------------------------------------------
 // Reasoning effort levels
-// ---------------------------------------------------------------------------
 const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 
-// ---------------------------------------------------------------------------
-// Minimal structural subset of pi's Model<Api> used by the subagent.
-// The real Model object from ctx.modelRegistry satisfies this shape.
-// ---------------------------------------------------------------------------
-export interface SubagentModel {
-  id: string;
-  baseUrl: string;
-  reasoning: boolean;
-  contextWindow: number;
-  thinkingLevelMap?: Record<string, string | null>;
-  compat?: { thinkingFormat?: string };
-}
-
-// ---------------------------------------------------------------------------
 // Config
-// ---------------------------------------------------------------------------
 export interface SubagentConfig {
   provider?: string;
   model?: string;
   maxTokens: number;
   defaultReasoningEffort: ReasoningLevel;
-  /** Whether `visit_page` offers `summary` mode. When false the option is
-   *  hidden from the model completely — no `summary` parameter and no mention
-   *  of it in the tool description, snippet, or guidelines — and pages are
-   *  returned as raw markdown. It does not disable the tool itself. Toggled
-   *  with /browse on|off. */
+  // Whether `visit_page` offers `summary` mode. When false the option is
+  // hidden from the model completely - no `summary` parameter and no mention
+  // of it in the tool description, snippet, or guidelines - and pages are
+  // returned as raw markdown. It does not disable the tool itself. Toggled
+  // with /browse on|off.
   summaryEnabled: boolean;
-  /** Whether `visit_page` offers `clean` mode (the Defuddle reader-mode
-   *  extraction). When false the option is hidden from the model completely —
-   *  no `clean` parameter and no mention of it (or of combining it with
-   *  `summary`) anywhere in the tool surface. It does not disable the tool
-   *  itself. Toggled with /browse clean on|off. */
+  // Whether `visit_page` offers `clean` mode (the Defuddle reader-mode
+  // extraction). When false the option is hidden from the model completely -
+  // no `clean` parameter and no mention of it (or of combining it with
+  // `summary`) anywhere in the tool surface. It does not disable the tool
+  // itself. Toggled with /browse clean on|off.
   cleanEnabled: boolean;
-  /** Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
-   *  string means a direct connection. Passed to Chrome at launch, so a
-   *  change takes effect on the next Chrome start (the next tool call
-   *  restarts Chrome automatically when the value differs). */
+  // Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
+  // string means a direct connection. Passed to Chrome at launch, so a
+  // change takes effect on the next Chrome start (the next tool call
+  // restarts Chrome automatically when the value differs).
   proxy: string;
 }
 
@@ -92,7 +74,7 @@ const DEFAULT_CONFIG: SubagentConfig = {
   proxy: "",
 };
 
-/** Live config singleton. Mutated in place by /browse and session_start. */
+// Live config singleton. Mutated in place by /browse and session_start.
 export const config: SubagentConfig = { ...DEFAULT_CONFIG };
 
 // Config file path. Overridden by index.ts via setConfigDir(getAgentDir()) so
@@ -111,9 +93,7 @@ export function configPath(): string {
   return join(configDir ?? defaultConfigDir(), "search-on-your-browser.json");
 }
 
-// ---------------------------------------------------------------------------
 // System prompt for the subagent
-// ---------------------------------------------------------------------------
 export const SUBAGENT_SYSTEM_PROMPT = [
   "You are an expert web research assistant.",
   "You are given the markdown content of a web page. Produce a comprehensive but",
@@ -129,16 +109,14 @@ export const SUBAGENT_SYSTEM_PROMPT = [
   "- Preserve code blocks, tables, or lists when they are directly relevant.",
   "- Use markdown formatting (headings, lists, tables) when it aids clarity.",
   "- Structure the summary so it is easy to scan.",
-  "- Do not mention that you were given page content or that you are a subagent —",
+  "- Do not mention that you were given page content or that you are a subagent -",
   "  just return the summary.",
 ].join("\n");
 
-/** Instruction appended to the page content in the user message. */
+// Instruction appended to the page content in the user message.
 const SUMMARY_INSTRUCTION = "Summarize all the useful information on this page.";
 
-// ---------------------------------------------------------------------------
 // Coercion helpers (config file is arbitrary JSON)
-// ---------------------------------------------------------------------------
 type RawConfig = Record<string, unknown>;
 
 function asString(v: unknown): string | undefined {
@@ -158,7 +136,7 @@ function asBool(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
 
-/** Parse a boolean env var: 1/true/yes/on → true, 0/false/no/off → false. */
+// Parse a boolean env var: 1/true/yes/on -> true, 0/false/no/off -> false.
 function asEnvBool(v: string | undefined): boolean | undefined {
   if (v === undefined) return undefined;
   const s = v.trim().toLowerCase();
@@ -167,15 +145,13 @@ function asEnvBool(v: string | undefined): boolean | undefined {
   return undefined;
 }
 
-/**
- * Normalize a proxy value into what Chrome's `--proxy-server` expects.
- *
- * Accepts a full URL (`http://`, `https://`, `socks4://`, `socks5://`), a bare
- * `host:port` (scheme defaults to `http://`), and normalizes a trailing slash
- * away. Returns undefined for anything that is not a usable proxy — including
- * the explicit off switch (`""`, `"off"`, `"none"`, `"direct"`) — so callers
- * can fall through to the next config layer.
- */
+// Normalize a proxy value into what Chrome's `--proxy-server` expects.
+//
+// Accepts a full URL (`http://`, `https://`, `socks4://`, `socks5://`), a bare
+// `host:port` (scheme defaults to `http://`), and normalizes a trailing slash
+// away. Returns undefined for anything that is not a usable proxy - including
+// the explicit off switch (`""`, `"off"`, `"none"`, `"direct"`) - so callers
+// can fall through to the next config layer.
 export function normalizeProxy(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const raw = value.trim();
@@ -201,11 +177,9 @@ export function validateReasoningLevel(value: string | undefined): ReasoningLeve
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
 // Config persistence
-// ---------------------------------------------------------------------------
 
-/** Load config from the JSON file. Returns null if missing or unparseable. */
+// Load config from the JSON file. Returns null if missing or unparseable.
 export function loadConfigFile(): RawConfig | null {
   try {
     const path = configPath();
@@ -218,8 +192,8 @@ export function loadConfigFile(): RawConfig | null {
   }
 }
 
-/** Save current config to the JSON file. Browser launch settings live under a
- *  `browser` object so the file stays readable. */
+// Save current config to the JSON file. Browser launch settings live under a
+// `browser` object so the file stays readable.
 export function saveConfigFile(): void {
   try {
     const path = configPath();
@@ -235,18 +209,16 @@ export function saveConfigFile(): void {
     };
     writeFileSync(path, JSON.stringify(out, null, 2) + "\n");
   } catch {
-    // best effort — directory not writable, etc.
+    // best effort - directory not writable, etc.
   }
 }
 
-/**
- * Resolve config with priority:
- *   1. Config file (<agent-dir>/search-on-your-browser.json)
- *   2. Environment variables (PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, etc.)
- *   3. Built-in defaults
- *
- * The file wins over env vars so /browse config changes are sticky.
- */
+// Resolve config with priority:
+//   1. Config file (<agent-dir>/search-on-your-browser.json)
+//   2. Environment variables (PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, etc.)
+//   3. Built-in defaults
+//
+// The file wins over env vars so /browse config changes are sticky.
 export function resolveConfig(): SubagentConfig {
   const file = loadConfigFile();
   const envReasoning = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT);
@@ -279,17 +251,17 @@ export function resolveConfig(): SubagentConfig {
   };
 }
 
-/** Reload config from file/env into the live singleton. */
+// Reload config from file/env into the live singleton.
 export function reloadConfig(): void {
   Object.assign(config, resolveConfig());
 }
 
-/** Human-readable config summary for the /browse command.
- *
- *  `currentModel` (the active session model, from ctx.model) is shown so the
- *  user knows what summary mode will use when no explicit provider/model is
- *  configured — by default the subagent reuses the current Pi model and its
- *  already-configured auth, so no separate API key setup is needed. */
+// Human-readable config summary for the /browse command.
+//
+// `currentModel` (the active session model, from ctx.model) is shown so the
+// user knows what summary mode will use when no explicit provider/model is
+// configured - by default the subagent reuses the current Pi model and its
+// already-configured auth, so no separate API key setup is needed.
 export function configSummary(
   currentModel?: { provider: string; id: string; name?: string },
 ): string {
@@ -304,7 +276,7 @@ export function configSummary(
     ? `${config.provider}/${config.model}`
     : currentModel
       ? `${currentModel.provider}/${currentModel.id} (current model)`
-      : "(none — no current model)";
+      : "(none - no current model)";
   return [
     `Browse subagent configuration (source: ${src})`,
     `  Model:             ${modelLine}`,
@@ -323,7 +295,7 @@ export function configSummary(
           "page markdown is discarded). Without `summary`, visit_page returns the raw page.",
         ]
       : [
-          "Summary mode is disabled: visit_page does not offer `summary` at all — the option",
+          "Summary mode is disabled: visit_page does not offer `summary` at all - the option",
           "is hidden from the model and pages are always returned as raw markdown. The model",
           "settings above are kept for when you re-enable it with /browse on.",
         ]),
@@ -331,13 +303,13 @@ export function configSummary(
       ? []
       : [
           "",
-          "Clean mode is disabled: visit_page does not offer `clean` at all — the option is",
+          "Clean mode is disabled: visit_page does not offer `clean` at all - the option is",
           "hidden from the model and the default block-walker extractor is always used.",
           "Re-enable it with /browse clean on.",
         ]),
     ``,
     "By default the subagent reuses your current Pi model (shown above) with its",
-    "already-configured auth — no API keys to set up. To pin a different model:",
+    "already-configured auth - no API keys to set up. To pin a different model:",
     "  /browse provider <provider>   /browse model <model-id>",
     "Other settings: max-tokens, reasoning-effort, proxy. Summary mode: /browse on|off.",
     "Clean mode: /browse clean on|off.",
@@ -347,19 +319,15 @@ export function configSummary(
   ].join("\n");
 }
 
-// ---------------------------------------------------------------------------
 // Token budget / truncation
-// ---------------------------------------------------------------------------
 
-/**
- * Truncate page content so the subagent request fits within the model's
- * context window. Tokens are estimated at 4 chars each (rough but safe).
- * Room is reserved for the system prompt, the summary instruction, and max
- * output tokens.
- */
+// Truncate page content so the subagent request fits within the model's
+// context window. Tokens are estimated at 4 chars each (rough but safe).
+// Room is reserved for the system prompt, the summary instruction, and max
+// output tokens.
 export function truncateForContext(
   content: string,
-  model: SubagentModel,
+  contextWindow: number,
   maxTokens: number,
 ): { content: string; truncated: boolean; originalChars: number } {
   const originalChars = content.length;
@@ -369,7 +337,7 @@ export function truncateForContext(
     Math.ceil(SUMMARY_INSTRUCTION.length / TOKEN_CHARS) +
     maxTokens +
     500; // safety buffer for URL, wrappers, message overhead
-  const availableTokens = Math.max(0, model.contextWindow - reservedTokens);
+  const availableTokens = Math.max(0, contextWindow - reservedTokens);
   const maxChars = Math.max(0, availableTokens * TOKEN_CHARS);
 
   if (originalChars <= maxChars) {
@@ -382,157 +350,17 @@ export function truncateForContext(
   return { content: slice + NOTICE, truncated: true, originalChars };
 }
 
-// ---------------------------------------------------------------------------
-// Message building
-// ---------------------------------------------------------------------------
+// Summary request
 
-export interface ChatMessage {
-  role: "system" | "user";
-  content: string;
-}
-
-/** Build the OpenAI chat-completions messages for the subagent call. */
-export function buildMessages(url: string, content: string): ChatMessage[] {
-  const userContent =
+// Build the user-message text handed to the subagent: the page URL, the page
+// markdown between delimiters, and the summarize instruction. index.ts wraps
+// this into a user message and sends it through Pi's provider-neutral stream
+// API (ctx.modelRegistry.streamSimple()).
+export function buildSummaryPrompt(url: string, content: string): string {
+  return (
     `URL: ${url}\n\n` +
     `PAGE CONTENT (markdown):\n` +
     `---\n${content}\n---\n\n` +
-    SUMMARY_INSTRUCTION;
-  return [
-    { role: "system", content: SUBAGENT_SYSTEM_PROMPT },
-    { role: "user", content: userContent },
-  ];
-}
-
-// ---------------------------------------------------------------------------
-// Reasoning params (mirrors vision-tool's buildReasoningParams)
-// ---------------------------------------------------------------------------
-
-/**
- * Build the reasoning/thinking parameters for the API request.
- *
- * Only sends reasoning params when the model has `reasoning: true`.
- * Respects the model's `thinkingLevelMap` (null = level unsupported → skip)
- * and `compat.thinkingFormat` for provider-specific formats:
- * - qwen / qwen-chat-template: enable_thinking: boolean
- * - deepseek / openrouter:     reasoning: { effort }
- * - together:                  reasoning: { enabled } + reasoning_effort
- * - default (OpenAI):          reasoning_effort
- */
-export function buildReasoningParams(
-  model: SubagentModel,
-  level: ReasoningLevel,
-): Record<string, unknown> | undefined {
-  if (!model.reasoning) return undefined;
-
-  const levelMap = model.thinkingLevelMap;
-  let effectiveLevel: string | null = level;
-
-  if (levelMap) {
-    const mapped = levelMap[level];
-    if (mapped === null) {
-      // Level explicitly unsupported — skip reasoning params entirely.
-      return undefined;
-    }
-    if (mapped !== undefined) {
-      effectiveLevel = mapped;
-    }
-  }
-
-  const format = model.compat?.thinkingFormat;
-
-  if (format === "qwen" || format === "qwen-chat-template") {
-    const enable = effectiveLevel !== "off" && effectiveLevel !== "none";
-    if (format === "qwen-chat-template") {
-      return { chat_template_kwargs: { enable_thinking: enable } };
-    }
-    return { enable_thinking: enable };
-  }
-
-  if (format === "deepseek" || format === "openrouter") {
-    // Mirror pi: OpenRouter sends effort: "none" when reasoning is off.
-    if (effectiveLevel === "off" || effectiveLevel === "none") {
-      return { reasoning: { effort: "none" } };
-    }
-    return { reasoning: { effort: effectiveLevel } };
-  }
-
-  if (format === "together") {
-    const enabled = effectiveLevel !== "off" && effectiveLevel !== "none";
-    if (!enabled) {
-      return { reasoning: { enabled: false } };
-    }
-    return { reasoning: { enabled: true }, reasoning_effort: effectiveLevel };
-  }
-
-  // Default: standard OpenAI reasoning_effort.
-  // Mirror pi: when reasoning is "off", don't send the param at all (pi only
-  // sends reasoning_effort when the value is truthy). Sending "off" causes
-  // HTTP 400 on APIs (e.g. vLLM) that accept "none"/"minimal"/... but not "off".
-  if (effectiveLevel === "off" || effectiveLevel === "none") {
-    return undefined;
-  }
-  return { reasoning_effort: effectiveLevel };
-}
-
-// ---------------------------------------------------------------------------
-// The model call
-// ---------------------------------------------------------------------------
-
-/**
- * Call the subagent model with the page content and return its summary.
- *
- * Makes a direct OpenAI-compatible POST to `${baseUrl}/chat/completions`.
- * The configured model's baseUrl must therefore be OpenAI-compatible (this is
- * the same constraint as the vision tool — most providers qualify, including
- * OpenAI, OpenRouter, Together, Groq, DeepSeek, Mistral, and local
- * Ollama / LM Studio).
- */
-export async function callSubagentModel(
-  model: SubagentModel,
-  apiKey: string | undefined,
-  headers: Record<string, string> | undefined,
-  url: string,
-  content: string,
-  signal: AbortSignal | undefined,
-  reasoningLevel: ReasoningLevel,
-  maxTokens: number,
-): Promise<string> {
-  const baseUrl = model.baseUrl.replace(/\/+$/, "");
-  const messages = buildMessages(url, content);
-  const reasoningParams = buildReasoningParams(model, reasoningLevel);
-
-  const body: Record<string, unknown> = {
-    model: model.id,
-    messages,
-    max_tokens: maxTokens,
-    temperature: 0,
-  };
-  if (reasoningParams) Object.assign(body, reasoningParams);
-
-  const reqHeaders: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...(headers ?? {}),
-  };
-  if (apiKey && !reqHeaders.Authorization) {
-    reqHeaders.Authorization = `Bearer ${apiKey}`;
-  }
-
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: reqHeaders,
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errBody = await response.text().catch(() => "");
-    throw new Error(`Subagent model returned ${response.status}: ${errBody.slice(0, 500)}`);
-  }
-
-  const json = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-  };
-  const msg = json.choices?.[0]?.message;
-  return msg?.content || msg?.reasoning_content || "(no response from subagent model)";
+    SUMMARY_INSTRUCTION
+  );
 }

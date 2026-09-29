@@ -16,7 +16,7 @@ import {
 // If the escaping is wrong (e.g. a single \n becomes a real newline inside a
 // "..." string literal), the page throws a SyntaxError when CDP evaluates it.
 // This test catches that without a browser: new Function(js) parses but does
-// not execute, so missing `document` / `window` refs are fine — only syntax
+// not execute, so missing `document` / `window` refs are fine - only syntax
 // errors fail.
 
 const extractors: Record<string, string> = {
@@ -35,7 +35,7 @@ for (const [name, js] of Object.entries(extractors)) {
   test(`${name} is valid JavaScript (no template-literal escaping errors)`, () => {
     assert.doesNotThrow(
       () => new Function(js),
-      `${name} failed to parse — check \\n / \\" escaping in the template literal`,
+      `${name} failed to parse - check \\n / \\" escaping in the template literal`,
     );
   });
 }

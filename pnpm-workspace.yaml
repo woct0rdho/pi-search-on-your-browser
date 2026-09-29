@@ -1,0 +1,18 @@
+minimumReleaseAgeExclude:
+  - '@earendil-works/chord@0.99.1'
+  - '@earendil-works/pi-agent-core@0.99.1'
+  - '@earendil-works/pi-ai@0.99.1'
+  - '@earendil-works/pi-codemode@0.99.1'
+  - '@earendil-works/pi-coding-agent@0.99.1'
+  - '@earendil-works/pi-mcp@0.99.1'
+  - '@earendil-works/pi-telemetry@0.99.1'
+  - '@earendil-works/pi-tui@0.99.1'
+# Dev-only transitive dependencies of pi; their install scripts are not
+# needed for typechecking or the test suite (and pnpm blocks them by default).
+# strictDepBuilds=false keeps `pnpm install` successful with those blocks in
+# place instead of exiting with ERR_PNPM_IGNORED_BUILDS.
+strictDepBuilds: false
+ignoredBuiltDependencies:
+  - '@google/genai'
+  - esbuild
+  - protobufjs

@@ -1,14 +1,12 @@
-/**
- * Chrome DevTools Protocol (CDP) client — Node.js built-in WebSocket.
- *
- * Same approach as ds4-agent (@antirez): visible Chrome (not headless),
- * CDP WebSocket navigation, inline JavaScript extractors in the page.
- *
- * Reference: https://x.com/antirez/status/2066233392916525379
- *
- * Profile at ~/.pi-search-browser/ — dedicated, like ds4-agent's ~/.ds4/browser.
- * Cookies and sessions persist across calls.
- */
+// Chrome DevTools Protocol (CDP) client - Node.js built-in WebSocket.
+//
+// Same approach as ds4-agent (@antirez): visible Chrome (not headless),
+// CDP WebSocket navigation, inline JavaScript extractors in the page.
+//
+// Reference: https://x.com/antirez/status/2066233392916525379
+//
+// Profile at ~/.pi-search-browser/ - dedicated, like ds4-agent's ~/.ds4/browser.
+// Cookies and sessions persist across calls.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -41,79 +39,69 @@ const CDP_PORT = 9322;
 const CDP_TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 1_048_576; // 1 MB
 
-/** Timeout for the small HTTP calls to Chrome's DevTools endpoint
- *  (/json/version, /json/close). They answer instantly while Chrome is alive;
- *  without a timeout a wedged browser would hang the tool forever. */
+// Timeout for the small HTTP calls to Chrome's DevTools endpoint
+// (/json/version, /json/close). They answer instantly while Chrome is alive;
+// without a timeout a wedged browser would hang the tool forever.
 const CDP_HTTP_TIMEOUT_MS = 3_000;
 
-/**
- * `Page.navigate` normally answers in milliseconds, but it is dispatched
- * through the browser process and can stall for tens of seconds when the
- * browser is busy: several parallel tool tabs loading heavy pages at once, a
- * proxy re-establishing its tunnels, or a background renderer that is still
- * starting up. A single stall used to fail the whole tool call with "CDP call
- * timeout: Page.navigate" (observed for real: two parallel GitHub visits
- * through a slow proxy, one navigation took >30s). The command is idempotent
- * for a fixed URL, so a timed-out attempt is retried.
- */
+// `Page.navigate` normally answers in milliseconds, but it is dispatched
+// through the browser process and can stall for tens of seconds when the
+// browser is busy: several parallel tool tabs loading heavy pages at once, a
+// proxy re-establishing its tunnels, or a background renderer that is still
+// starting up. A single stall used to fail the whole tool call with "CDP call
+// timeout: Page.navigate" (observed for real: two parallel GitHub visits
+// through a slow proxy, one navigation took >30s). The command is idempotent
+// for a fixed URL, so a timed-out attempt is retried.
 export const NAVIGATE_TIMEOUT_MS = 15_000;
 export const NAVIGATE_ATTEMPTS = 3;
 
-/**
- * Default wait for a bot-check interstitial to solve itself. These pages
- * answer the first request with 403/503 (Cloudflare marks it
- * `cf-mitigated: challenge`), run their challenge in the page and reload to
- * the real document a few seconds later. Measured on a fresh profile through
- * a proxy: 403 at ~3.2s, self-reload to 200 at ~7.6s. An ordinary browser
- * never surfaces that first response — it only shows the final page.
- */
+// Default wait for a bot-check interstitial to solve itself. These pages
+// answer the first request with 403/503 (Cloudflare marks it
+// `cf-mitigated: challenge`), run their challenge in the page and reload to
+// the real document a few seconds later. Measured on a fresh profile through
+// a proxy: 403 at ~3.2s, self-reload to 200 at ~7.6s. An ordinary browser
+// never surfaces that first response - it only shows the final page.
 export const INTERSTITIAL_WAIT_MS = 15_000;
-/**
- * After `Page.reload` on a non-challenge 403/503 (the F5 move), how long to
- * wait for the retried document response before giving up.
- */
+// After `Page.reload` on a non-challenge 403/503 (the F5 move), how long to
+// wait for the retried document response before giving up.
 export const INTERSTITIAL_RELOAD_WAIT_MS = 8_000;
 const INTERSTITIAL_POLL_MS = 300;
 
-/**
- * Text bot-check interstitials render in their title/body. Covers Cloudflare,
- * DataDome, PerimeterX/HUMAN ("Access to this page has been denied"), Akamai,
- * Imperva ("Request unsuccessful...") and generic "verify you are human"
- * pages. Deliberately specific: a bare "Access Denied" auth page must not be
- * mistaken for a solvable challenge.
- */
+// Text bot-check interstitials render in their title/body. Covers Cloudflare,
+// DataDome, PerimeterX/HUMAN ("Access to this page has been denied"), Akamai,
+// Imperva ("Request unsuccessful...") and generic "verify you are human"
+// pages. Deliberately specific: a bare "Access Denied" auth page must not be
+// mistaken for a solvable challenge.
 export const CHALLENGE_PAGE_RE =
   /just a moment|attention required|checking (?:your browser|if the site)|verify (?:you are|you're|that you are) (?:a )?human|are you a robot|access to this page has been denied|request unsuccessful|enable javascript and cookies|ddos protection|under attack|incapsula|datadome|perimeterx|please wait while we (?:verify|check)/i;
 
-/** Probe evaluated on a 403/503 to tell a solvable interstitial from a plain
- *  denial. Cheap (title + first 400 chars of visible text). */
+// Probe evaluated on a 403/503 to tell a solvable interstitial from a plain
+// denial. Cheap (title + first 400 chars of visible text).
 const CHALLENGE_PROBE_JS = `(document.title || "") + " " + (document.body ? document.body.innerText.slice(0, 400) : "")`;
 
-// ── Utilities ─────────────────────────────────────────────────────────────
+// Utilities
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Progress callback for the tool UI (Rendered inside the tool call block by
- *  `onUpdate`, so it never disturbs the input line). */
+// Progress callback for the tool UI (Rendered inside the tool call block by
+// `onUpdate`, so it never disturbs the input line).
 type StatusFn = (msg: string) => void;
 
-/**
- * Diagnostics go to stderr only when PI_SEARCH_DEBUG is set. Pi's TUI runs in
- * raw mode and prints raw stderr writes on the input bar, so anything logged
- * unconditionally shows up as `[pi-search] ...` noise while typing. Messages
- * the user should actually see go through the tool's status callback instead
- * (see StatusFn); everything else is available with PI_SEARCH_DEBUG=1.
- */
+// Diagnostics go to stderr only when PI_SEARCH_DEBUG is set. Pi's TUI runs in
+// raw mode and prints raw stderr writes on the input bar, so anything logged
+// unconditionally shows up as `[pi-search] ...` noise while typing. Messages
+// the user should actually see go through the tool's status callback instead
+// (see StatusFn); everything else is available with PI_SEARCH_DEBUG=1.
 function debugLog(message: string): void {
   if (process.env.PI_SEARCH_DEBUG) console.error(`[pi-search] ${message}`);
 }
 
-/** Case-insensitive environment lookup joined with path segments.
- *  Windows env var names are not consistently cased in `process.env`
- *  ("ProgramFiles(x86)", "PROGRAMFILES", ...), so look the name up
- *  case-insensitively rather than guessing the exact casing. */
+// Case-insensitive environment lookup joined with path segments.
+// Windows env var names are not consistently cased in `process.env`
+// ("ProgramFiles(x86)", "PROGRAMFILES", ...), so look the name up
+// case-insensitively rather than guessing the exact casing.
 function envPath(name: string, ...segments: string[]): string | undefined {
   const wanted = name.toLowerCase();
   for (const key of Object.keys(process.env)) {
@@ -124,18 +112,18 @@ function envPath(name: string, ...segments: string[]): string | undefined {
   return undefined;
 }
 
-/** Candidate browser executables, most-preferred first. `CHROME_PATH` always
- *  wins; then the platform's default install locations. Edge is last on
- *  Windows — it is Chromium-based and accepts the same CDP flags, so it
- *  works as a fallback when Google Chrome is not installed. */
+// Candidate browser executables, most-preferred first. `CHROME_PATH` always
+// wins; then the platform's default install locations. Edge is last on
+// Windows - it is Chromium-based and accepts the same CDP flags, so it
+// works as a fallback when Google Chrome is not installed.
 export function chromeCandidates(): string[] {
   return [
     process.env.CHROME_PATH,
-    // Windows — Google Chrome (per-user then machine-wide installs)
+    // Windows - Google Chrome (per-user then machine-wide installs)
     envPath("LOCALAPPDATA", "Google", "Chrome", "Application", "chrome.exe"),
     envPath("PROGRAMFILES", "Google", "Chrome", "Application", "chrome.exe"),
     envPath("ProgramFiles(x86)", "Google", "Chrome", "Application", "chrome.exe"),
-    // Windows — Chromium
+    // Windows - Chromium
     envPath("LOCALAPPDATA", "Chromium", "Application", "chrome.exe"),
     envPath("PROGRAMFILES", "Chromium", "Application", "chrome.exe"),
     // macOS
@@ -147,17 +135,17 @@ export function chromeCandidates(): string[] {
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
     "/snap/bin/chromium",
-    // Windows — Microsoft Edge (Chromium-based, same CDP flags)
+    // Windows - Microsoft Edge (Chromium-based, same CDP flags)
     envPath("PROGRAMFILES", "Microsoft", "Edge", "Application", "msedge.exe"),
     envPath("ProgramFiles(x86)", "Microsoft", "Edge", "Application", "msedge.exe"),
     envPath("LOCALAPPDATA", "Microsoft", "Edge", "Application", "msedge.exe"),
   ].filter((p): p is string => Boolean(p));
 }
 
-/** First candidate that exists on disk, else a bare command name that spawn()
- *  resolves through PATH (the binary may be installed somewhere non-standard
- *  on Linux). launchChrome() turns a PATH-resolution failure into a readable
- *  error instead of an uncaughtException. */
+// First candidate that exists on disk, else a bare command name that spawn()
+// resolves through PATH (the binary may be installed somewhere non-standard
+// on Linux). launchChrome() turns a PATH-resolution failure into a readable
+// error instead of an uncaughtException.
 export function findChrome(): string {
   for (const p of chromeCandidates()) {
     if (existsSync(p)) return p;
@@ -165,16 +153,16 @@ export function findChrome(): string {
   return process.platform === "win32" ? "chrome.exe" : "google-chrome";
 }
 
-// ── CDP over WebSocket ────────────────────────────────────────────────────
+// CDP over WebSocket
 
 interface PendingCall {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
 }
 
-/** Minimal CDP interface used by runInPageSession. CDPClient implements this;
- *  tests pass a fake so the navigate/waitForSelector/extract logic can be
- *  exercised without a real browser or WebSocket. */
+// Minimal CDP interface used by runInPageSession. CDPClient implements this;
+// tests pass a fake so the navigate/waitForSelector/extract logic can be
+// exercised without a real browser or WebSocket.
 interface CDPLike {
   call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
   evaluate(expression: string): Promise<string>;
@@ -206,7 +194,7 @@ class CDPClient implements CDPLike {
 
       // The socket can die at any time (Chrome killed, tab/target crashed, a
       // restart). Reject the in-flight calls immediately so callers get a real
-      // error instead of waiting out the full per-call timeout — otherwise a
+      // error instead of waiting out the full per-call timeout - otherwise a
       // dead target turns into a misleading "CDP call timeout" 30s later.
       ws.onclose = () => {
         clearTimeout(timer);
@@ -220,7 +208,7 @@ class CDPClient implements CDPLike {
         } catch {
           return;
         }
-        // Events (no id field) — dispatch to handlers
+        // Events (no id field) - dispatch to handlers
         if (msg.id === undefined || msg.id === null) {
           if (msg.method) {
             const handlers = this.eventHandlers.get(msg.method);
@@ -252,7 +240,7 @@ class CDPClient implements CDPLike {
     await this.connectPromise;
   }
 
-  /** Reject every in-flight call (used when the socket dies). */
+  // Reject every in-flight call (used when the socket dies).
   private failPending(reason: string): void {
     const pending = [...this.pending.values()];
     this.pending.clear();
@@ -309,17 +297,17 @@ class CDPClient implements CDPLike {
   }
 }
 
-// ── Chrome process management ─────────────────────────────────────────────
+// Chrome process management
 
 let chromeProcess: ChildProcess | null = null;
-/** Serializes Chrome start/restart decisions across parallel tool calls (see
- *  withChromeLifecycle). Also covers shutdownChrome(). */
+// Serializes Chrome start/restart decisions across parallel tool calls (see
+// withChromeLifecycle). Also covers shutdownChrome().
 let chromeLifecycle: Promise<unknown> = Promise.resolve();
-/** Args of the Chrome started by *this* process (null when the live Chrome was
- *  started elsewhere — an earlier Pi session using the same profile). */
+// Args of the Chrome started by *this* process (null when the live Chrome was
+// started elsewhere - an earlier Pi session using the same profile).
 let launchedArgs: string[] | null = null;
-/** False once writing the launch marker has failed; disables restart-on-stale
- *  logic (no marker means we would restart Chrome on every call). */
+// False once writing the launch marker has failed; disables restart-on-stale
+// logic (no marker means we would restart Chrome on every call).
 let canPersistLaunchArgs = true;
 
 async function isChromeAlive(): Promise<boolean> {
@@ -333,10 +321,10 @@ async function isChromeAlive(): Promise<boolean> {
   }
 }
 
-/** Command-line flags used to launch the visible Chrome instance. Exported
- *  so the presence of individual flags (e.g. the backgrounding/occlusion
- *  flags that keep the renderer alive in background tabs/windows) can be
- *  asserted by unit tests without spawning a real Chrome. */
+// Command-line flags used to launch the visible Chrome instance. Exported
+// so the presence of individual flags (e.g. the backgrounding/occlusion
+// flags that keep the renderer alive in background tabs/windows) can be
+// asserted by unit tests without spawning a real Chrome.
 export const CHROME_LAUNCH_ARGS: readonly string[] = [
   `--remote-debugging-port=${CDP_PORT}`,
   "--remote-allow-origins=*",
@@ -349,7 +337,7 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   // Keep non-active tabs rendering at full speed. Tool tabs are opened in
   // the background (Target.createTarget { background: true }) to avoid
   // stealing focus, but Chrome otherwise suspends the renderer of background
-  // tabs — which makes window.scrollTo()/scrollBy() a no-op for triggering
+  // tabs - which makes window.scrollTo()/scrollBy() a no-op for triggering
   // lazy-loaded content (infinite scroll, lazy images, GitHub's deferred
   // sections). The async self-scrolling extractors (X/Reddit/Amazon) hit the
   // same wall. These flags keep the renderer alive so scrolling works even
@@ -360,7 +348,7 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "--disable-renderer-backgrounding",
   // Chrome's native window-occlusion detection (CalculateNativeWinOcclusion)
   // can fully freeze the renderer when the Chrome *window* is behind another
-  // window or unfocused — even with the three flags above. This shows up as
+  // window or unfocused - even with the three flags above. This shows up as
   // a full 30s Runtime.evaluate timeout (the renderer stops responding to
   // CDP entirely), not just missed lazy loads. It is especially severe on
   // GNOME Wayland, where we cannot programmatically focus/activate the
@@ -374,18 +362,16 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "about:blank",
 ];
 
-/**
- * Full launch arguments: the base flags above plus anything the configuration
- * demands (currently only the proxy). Exported so tests can assert the proxy
- * flag without spawning a real Chrome.
- *
- * The proxy comes from `browser.proxy` in
- * <agent-dir>/search-on-your-browser.json, or the PI_SEARCH_PROXY env var
- * (e.g. "http://127.0.0.1:8010", "socks5://127.0.0.1:1080"). Chrome applies
- * it to every request, including the CDP-driven navigations, so google_search
- * and visit_page work behind a required proxy. The value is read fresh on each
- * call so a config change is picked up without restarting Pi.
- */
+// Full launch arguments: the base flags above plus anything the configuration
+// demands (currently only the proxy). Exported so tests can assert the proxy
+// flag without spawning a real Chrome.
+//
+// The proxy comes from `browser.proxy` in
+// <agent-dir>/search-on-your-browser.json, or the PI_SEARCH_PROXY env var
+// (e.g. "http://127.0.0.1:8010", "socks5://127.0.0.1:1080"). Chrome applies
+// it to every request, including the CDP-driven navigations, so google_search
+// and visit_page work behind a required proxy. The value is read fresh on each
+// call so a config change is picked up without restarting Pi.
 export function chromeLaunchArgs(proxy: string = resolveConfig().proxy): string[] {
   const args = [...CHROME_LAUNCH_ARGS];
   if (proxy) {
@@ -396,16 +382,14 @@ export function chromeLaunchArgs(proxy: string = resolveConfig().proxy): string[
   return args;
 }
 
-/**
- * File inside the dedicated profile recording the flags the *currently
- * running* Chrome was started with. The profile directory outlives a Pi
- * session, so without this we cannot tell whether an already-open Chrome is
- * stale (e.g. launched before a proxy was configured) — it would silently keep
- * using the old flags. Read/written best-effort.
- */
+// File inside the dedicated profile recording the flags the *currently
+// running* Chrome was started with. The profile directory outlives a Pi
+// session, so without this we cannot tell whether an already-open Chrome is
+// stale (e.g. launched before a proxy was configured) - it would silently keep
+// using the old flags. Read/written best-effort.
 const LAUNCH_MARKER_FILE = join(PROFILE_DIR, ".pi-launch-args.json");
 
-/** Launch args recorded for the running Chrome, or null if unknown. */
+// Launch args recorded for the running Chrome, or null if unknown.
 export function readLaunchMarker(): string[] | null {
   try {
     if (!existsSync(LAUNCH_MARKER_FILE)) return null;
@@ -418,7 +402,7 @@ export function readLaunchMarker(): string[] | null {
   }
 }
 
-/** Record the launch args. Returns false when the marker can't be written. */
+// Record the launch args. Returns false when the marker can't be written.
 export function writeLaunchMarker(args: readonly string[]): boolean {
   try {
     mkdirSync(PROFILE_DIR, { recursive: true });
@@ -429,15 +413,15 @@ export function writeLaunchMarker(args: readonly string[]): boolean {
   }
 }
 
-/** Same flags in any order (Chrome only cares about the set). */
+// Same flags in any order (Chrome only cares about the set).
 function sameArgs(a: readonly string[], b: readonly string[]): boolean {
   if (a.length !== b.length) return false;
   const set = new Set(a);
   return b.every((arg) => set.has(arg));
 }
 
-/** Actionable message for a spawn failure (ENOENT/EACCES): says which binary
- *  was attempted and how to point the tool at the right one. */
+// Actionable message for a spawn failure (ENOENT/EACCES): says which binary
+// was attempted and how to point the tool at the right one.
 export function chromeSpawnErrorMessage(chromePath: string, err: Error): string {
   return (
     `Could not launch browser "${chromePath}": ${err.message}. ` +
@@ -465,7 +449,7 @@ async function launchChrome(args: readonly string[], status: StatusFn): Promise<
 
   // spawn() failure (ENOENT/EACCES) arrives asynchronously as an 'error'
   // event. With no listener attached, Node re-throws it as an
-  // uncaughtException — which kills the whole Pi process ("pi exiting due to
+  // uncaughtException - which kills the whole Pi process ("pi exiting due to
   // uncaughtException: Error: spawn google-chrome ENOENT"). Capture it here
   // and turn it into a normal rejected promise instead.
   const spawnState: { error: Error | null } = { error: null };
@@ -507,14 +491,14 @@ async function ensureChrome(status: StatusFn): Promise<void> {
       if (current && sameArgs(current, desired)) return;
 
       // Unknown flags (Chrome started by an older version, before the marker
-      // existed). Restart it once so the current flags — including a proxy —
+      // existed). Restart it once so the current flags - including a proxy -
       // are actually applied and recorded; if the marker can't be written we'd
       // restart on every single call, so leave it alone instead.
       if (current === null && !canPersistLaunchArgs) return;
 
       debugLog(
         current
-          ? "Chrome launch flags changed — restarting Chrome"
+          ? "Chrome launch flags changed - restarting Chrome"
           : "Restarting Chrome to align its launch flags"
       );
       status(current ? "Restarting Chrome to apply updated launch flags..." : "Restarting Chrome...");
@@ -529,16 +513,14 @@ async function ensureChrome(status: StatusFn): Promise<void> {
   });
 }
 
-/**
- * Run a Chrome lifecycle operation (ensure/start/restart/stop) under a lock.
- *
- * The agent often issues several google_search / visit_page calls in one turn,
- * and every call calls ensureChrome() first. Without serialization two calls
- * could (a) spawn two Chrome processes on a cold start, or (b) both detect the
- * same stale launch flags and each restart Chrome — the second killing the
- * browser the first one had already opened and navigated a tab in, which shows
- * up as a random "CDP call timeout" / connection error on the surviving call.
- */
+// Run a Chrome lifecycle operation (ensure/start/restart/stop) under a lock.
+//
+// The agent often issues several google_search / visit_page calls in one turn,
+// and every call calls ensureChrome() first. Without serialization two calls
+// could (a) spawn two Chrome processes on a cold start, or (b) both detect the
+// same stale launch flags and each restart Chrome - the second killing the
+// browser the first one had already opened and navigated a tab in, which shows
+// up as a random "CDP call timeout" / connection error on the surviving call.
 function withChromeLifecycle<T>(fn: () => Promise<T>): Promise<T> {
   const run = chromeLifecycle.then(fn, fn);
   // Keep the chain alive regardless of this operation's outcome; the caller
@@ -547,8 +529,8 @@ function withChromeLifecycle<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/** Stop the running Chrome (ours: signal it; started by another Pi session:
- *  ask it to close over CDP) and wait for the debugging port to go away. */
+// Stop the running Chrome (ours: signal it; started by another Pi session:
+// ask it to close over CDP) and wait for the debugging port to go away.
 async function stopChrome(): Promise<void> {
   if (chromeProcess) {
     chromeProcess.kill();
@@ -560,7 +542,7 @@ async function stopChrome(): Promise<void> {
       await browserCdp.call("Browser.close");
       browserCdp.disconnect();
     } catch {
-      // best effort — it may already be gone
+      // best effort - it may already be gone
     }
   }
   launchedArgs = null;
@@ -569,10 +551,10 @@ async function stopChrome(): Promise<void> {
     if (!(await isChromeAlive())) return;
     await sleep(250);
   }
-  debugLog("Chrome did not exit within 5s — continuing anyway");
+  debugLog("Chrome did not exit within 5s - continuing anyway");
 }
 
-// ── Page operations ──────────────────────────────────────────────────────
+// Page operations
 
 interface CDPTab {
   wsUrl: string;
@@ -625,46 +607,44 @@ interface RunInPageOptions {
   initialWaitMs?: number;
   waitForSelector?: string;
   waitForTimeoutMs?: number;
-  /** Poll interval for waitForSelector (ms). Default 400. */
+  // Poll interval for waitForSelector (ms). Default 400.
   waitForSelectorPollMs?: number;
-  /** How long to wait for a bot-check interstitial (403/503) to clear itself.
-   *  0 disables the interstitial handling entirely (used by tests that pin the
-   *  plain HTTP-error path). Default INTERSTITIAL_WAIT_MS. */
+  // How long to wait for a bot-check interstitial (403/503) to clear itself.
+  // 0 disables the interstitial handling entirely (used by tests that pin the
+  // plain HTTP-error path). Default INTERSTITIAL_WAIT_MS.
   interstitialWaitMs?: number;
-  /** How long to wait for the response to a `Page.reload` retry on a
-   *  non-challenge 403/503. Default INTERSTITIAL_RELOAD_WAIT_MS. */
+  // How long to wait for the response to a `Page.reload` retry on a
+  // non-challenge 403/503. Default INTERSTITIAL_RELOAD_WAIT_MS.
   interstitialReloadWaitMs?: number;
-  /** Optional fallback JS to run in the SAME tab if the primary `js` returns
-   *  an error marker or very short content. Avoids a second navigation when
-   *  the primary extractor (e.g. Defuddle) fails on a page. */
+  // Optional fallback JS to run in the SAME tab if the primary `js` returns
+  // an error marker or very short content. Avoids a second navigation when
+  // the primary extractor (e.g. Defuddle) fails on a page.
   fallbackJs?: string;
-  /** When true, call CDP `Page.bringToFront` after navigation so the tab
-   *  becomes the active tab and Chrome resumes its renderer. Needed for any
-   *  path that scrolls — `dynamicScroll` (generic pages) or the async
-   *  self-scrolling extractors (X/Reddit/Amazon) — because background tabs
-   *  don't paint and scroll-triggered lazy loading never fires without it.
-   *  Default false so non-scrolling pages (Google search, Scholar, Defuddle)
-   *  don't steal focus. */
+  // When true, call CDP `Page.bringToFront` after navigation so the tab
+  // becomes the active tab and Chrome resumes its renderer. Needed for any
+  // path that scrolls - `dynamicScroll` (generic pages) or the async
+  // self-scrolling extractors (X/Reddit/Amazon) - because background tabs
+  // don't paint and scroll-triggered lazy loading never fires without it.
+  // Default false so non-scrolling pages (Google search, Scholar, Defuddle)
+  // don't steal focus.
   bringToFront?: boolean;
-  /** When true, resolve Google `/goto` redirect links in the open tab before
-   *  returning the markdown (see src/google-links.ts). Used by googleSearch;
-   *  requires the CDP client to receive `Network.responseReceived` events
-   *  (Network.enable is already called by this session). */
+  // When true, resolve Google `/goto` redirect links in the open tab before
+  // returning the markdown (see src/google-links.ts). Used by googleSearch;
+  // requires the CDP client to receive `Network.responseReceived` events
+  // (Network.enable is already called by this session).
   resolveGoogleRedirects?: boolean;
   onStatus: (msg: string) => void;
 }
 
-/**
- * Issue `Page.navigate`, retrying when the command itself times out.
- *
- * Two things make this more than a plain await:
- *  - The page may finish loading while the command's reply is still stuck in
- *    the browser — exactly what a slow proxy or a saturated network looks
- *    like. The load event wins the race, so the call proceeds normally.
- *  - A timeout is retried (up to NAVIGATE_ATTEMPTS). Errors that are *not*
- *    timeouts — a closed CDP socket, a rejected command — are fatal and are
- *    re-thrown immediately: retrying on a dead connection is pointless.
- */
+// Issue `Page.navigate`, retrying when the command itself times out.
+//
+// Two things make this more than a plain await:
+//  - The page may finish loading while the command's reply is still stuck in
+//    the browser - exactly what a slow proxy or a saturated network looks
+//    like. The load event wins the race, so the call proceeds normally.
+//  - A timeout is retried (up to NAVIGATE_ATTEMPTS). Errors that are *not*
+//    timeouts - a closed CDP socket, a rejected command - are fatal and are
+//    re-thrown immediately: retrying on a dead connection is pointless.
 async function navigateToPage(
   cdp: CDPLike,
   url: string,
@@ -691,19 +671,19 @@ async function navigateToPage(
     if (winner !== "timeout") return;
 
     if (attempt < NAVIGATE_ATTEMPTS) {
-      onStatus(`Navigation is slow — retrying (${attempt + 1}/${NAVIGATE_ATTEMPTS})...`);
+      onStatus(`Navigation is slow - retrying (${attempt + 1}/${NAVIGATE_ATTEMPTS})...`);
       await sleep(500);
     }
   }
 
   throw new Error(
     `${lastError?.message ?? "CDP call timeout: Page.navigate"} ` +
-      `(after ${NAVIGATE_ATTEMPTS} attempts of ${NAVIGATE_TIMEOUT_MS / 1000}s — the page or the proxy may be slow)`,
+      `(after ${NAVIGATE_ATTEMPTS} attempts of ${NAVIGATE_TIMEOUT_MS / 1000}s - the page or the proxy may be slow)`,
   );
 }
 
-/** True when the committed 403/503 page is a solvable bot-check interstitial
- *  (Cloudflare, DataDome, ...) rather than a plain denial. */
+// True when the committed 403/503 page is a solvable bot-check interstitial
+// (Cloudflare, DataDome, ...) rather than a plain denial.
 async function looksLikeChallengePage(cdp: CDPLike): Promise<boolean> {
   try {
     const probe = await cdp.evaluate(CHALLENGE_PROBE_JS);
@@ -713,9 +693,9 @@ async function looksLikeChallengePage(cdp: CDPLike): Promise<boolean> {
   }
 }
 
-/** Session logic: navigate, wait, scroll, extract — all against a connected
- *  CDP client. Split out from runInPage so it can be tested with a fake
- *  CDPLike (no real Chrome, no WebSocket). */
+// Session logic: navigate, wait, scroll, extract - all against a connected
+// CDP client. Split out from runInPage so it can be tested with a fake
+// CDPLike (no real Chrome, no WebSocket).
 async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<string> {
   const {
     url,
@@ -744,7 +724,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
 
   // Track every Document response, not just the first. Bot-check interstitials
   // answer the initial request with 403/503, run their challenge in the page
-  // and reload to the real document — an ordinary browser never sees that
+  // and reload to the real document - an ordinary browser never sees that
   // first response. The frame id is recorded and matched against the main
   // frame after the fact because `responseReceived` arrives before
   // `Page.frameNavigated`; iframe Document responses (ad/user-sync pages) are
@@ -754,7 +734,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     statusText: string;
     url: string;
     frameId?: string;
-    /** Cloudflare marks challenge interstitials with `cf-mitigated: challenge`. */
+    // Cloudflare marks challenge interstitials with `cf-mitigated: challenge`.
     challenge: boolean;
   }
   const docResponses: DocResponse[] = [];
@@ -789,8 +769,8 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   });
   await cdp.call("Network.enable");
 
-  /** Latest Document response belonging to the main frame. Falls back to the
-   *  first response when no frame was ever captured (e.g. a fake CDP). */
+  // Latest Document response belonging to the main frame. Falls back to the
+  // first response when no frame was ever captured (e.g. a fake CDP).
   const sameDoc = (r: DocResponse): boolean => {
     if (mainFrameId !== undefined) return r.frameId === mainFrameId;
     if (mainFrameUrl !== undefined) {
@@ -808,7 +788,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   const mainDocCount = (): number => docResponses.filter(sameDoc).length;
 
   // Resolve a 403/503 the way a browser would. Challenge pages reload
-  // themselves once solved — the tab must stay open and alive for that (the
+  // themselves once solved - the tab must stay open and alive for that (the
   // old code closed it right away). Anything without challenge markers gets
   // one reload, the F5 move.
   const resolveInterstitial = async (): Promise<void> => {
@@ -824,27 +804,27 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     }
 
     if (first.challenge || (await looksLikeChallengePage(cdp))) {
-      onStatus(`HTTP ${first.status} — waiting for the site's bot check to clear...`);
+      onStatus(`HTTP ${first.status} - waiting for the site's bot check to clear...`);
       const deadline = Date.now() + interstitialWaitMs;
       while (Date.now() < deadline) {
         await sleep(INTERSTITIAL_POLL_MS);
         const doc = latestMainDoc();
         if (doc && doc.status < 400) {
-          onStatus("Bot check cleared — extracting...");
+          onStatus("Bot check cleared - extracting...");
           return;
         }
       }
-      return; // still blocked → error marker below
+      return; // still blocked -> error marker below
     }
 
     // No challenge markers: treat it as a stale first response (cookie wall,
     // transient WAF rule, ...) and reload once, like a user pressing F5.
-    onStatus(`HTTP ${first.status} — retrying once...`);
+    onStatus(`HTTP ${first.status} - retrying once...`);
     const responsesBefore = mainDocCount();
     try {
       await cdp.call("Page.reload", { ignoreCache: false });
     } catch {
-      return; // reload refused → report the original error
+      return; // reload refused -> report the original error
     }
     const deadline = Date.now() + interstitialReloadWaitMs;
     while (Date.now() < deadline) {
@@ -874,7 +854,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   }
 
   // If the server returned an HTTP error (4xx/5xx) that stuck, don't bother
-  // running the extractor on the error page — return a clear marker so
+  // running the extractor on the error page - return a clear marker so
   // visitPage can surface it to the LLM as an error result. This prevents the
   // model from receiving "Page Not Found" gibberish as if it were content.
   const finalDoc = latestMainDoc();
@@ -892,7 +872,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // Make this the active tab before any scrolling. Tool tabs open in the
   // background; Chrome suspends rendering for non-active tabs, so
   // window.scrollTo() (dynamicScroll, below) and the self-scrolling inside
-  // the async extractors would otherwise not trigger lazy-loaded content —
+  // the async extractors would otherwise not trigger lazy-loaded content -
   // the "Scrolling for dynamic content..." step silently did nothing until
   // you manually clicked the tab. Skipped for HTTP errors (dead pages) and
   // when bringToFront is unset (Google/Scholar/Defuddle: no scrolling).
@@ -956,14 +936,14 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // Fallback: if the primary extractor returned an error marker or nothing
   // useful, run the fallback JS in the same tab (no re-navigation).
   if (opts.fallbackJs && (result.startsWith("__DEFUDDLE_ERROR__") || result.trim().length < 50)) {
-    onStatus("Clean extraction yielded no content — falling back to generic extractor...");
+    onStatus("Clean extraction yielded no content - falling back to generic extractor...");
     result = await cdp.evaluate(opts.fallbackJs);
   }
 
   // Google search results may contain `/goto?url=<opaque>` redirect wrappers
   // that JavaScript cannot decode or follow. Ask Google for the destination
-  // (302 Location) from inside this tab — it has the session, cookies and
-  // proxy of the search — and swap the direct URLs into the markdown.
+  // (302 Location) from inside this tab - it has the session, cookies and
+  // proxy of the search - and swap the direct URLs into the markdown.
   if (opts.resolveGoogleRedirects) {
     result = await resolveGoogleRedirectsInBrowser(cdp, result, { onStatus });
   }
@@ -991,37 +971,37 @@ async function runInPage(opts: RunInPageOptions): Promise<string> {
   }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// Public API
 
 export interface SearchResult {
   markdown: string;
   url: string;
-  /** HTTP status of the main document response, when captured. Set (with an
-   *  empty `markdown`) when the server returned a 4xx/5xx error, so the tool
-   *  layer can surface it as an error instead of extracting the error page. */
+  // HTTP status of the main document response, when captured. Set (with an
+  // empty `markdown`) when the server returned a 4xx/5xx error, so the tool
+  // layer can surface it as an error instead of extracting the error page.
   httpStatus?: number;
   httpStatusText?: string;
 }
 
 export interface VisitPageOptions {
   onStatus?: (msg: string) => void;
-  /** When true, generic (non-specialized) pages are extracted with Defuddle —
-   *  a reader-mode-style article extractor that drops navigation, sidebars,
-   *  ads, and footers, returning clean Markdown. Far better than the default
-   *  block-walker for articles, docs, and blog posts. If Defuddle fails or
-   *  returns nothing, falls back to the generic extractor automatically.
-   *
-   *  Specialized pages (X, Reddit, Amazon, Scholar) always use their
-   *  purpose-built extractors, which already produce clean compact Markdown —
-   *  `clean` has no additional effect on them. */
+  // When true, generic (non-specialized) pages are extracted with Defuddle -
+  // a reader-mode-style article extractor that drops navigation, sidebars,
+  // ads, and footers, returning clean Markdown. Far better than the default
+  // block-walker for articles, docs, and blog posts. If Defuddle fails or
+  // returns nothing, falls back to the generic extractor automatically.
+  //
+  // Specialized pages (X, Reddit, Amazon, Scholar) always use their
+  // purpose-built extractors, which already produce clean compact Markdown -
+  // `clean` has no additional effect on them.
   clean?: boolean;
 }
 
-/** Run an extractor in a fresh tab, then resolve HTTP errors. Wraps the
- *  common pattern shared by every visitPage path and googleSearch: navigate,
- *  (optionally) wait for a selector, extract, resolve. Defaults match the
- *  specialized extractors (no consent click, no dynamic scroll, 500ms render
- *  wait, 10s selector timeout) — callers override only what differs. */
+// Run an extractor in a fresh tab, then resolve HTTP errors. Wraps the
+// common pattern shared by every visitPage path and googleSearch: navigate,
+// (optionally) wait for a selector, extract, resolve. Defaults match the
+// specialized extractors (no consent click, no dynamic scroll, 500ms render
+// wait, 10s selector timeout) - callers override only what differs.
 async function extractVia(
   url: string,
   status: (msg: string) => void,
@@ -1035,8 +1015,8 @@ async function extractVia(
     initialWaitMs?: number;
     fallbackJs?: string;
     bringToFront?: boolean;
-    /** Resolve Google `/goto` redirect links in the open tab before returning
-     *  (see src/google-links.ts). Used by googleSearch. */
+    // Resolve Google `/goto` redirect links in the open tab before returning
+    // (see src/google-links.ts). Used by googleSearch.
     resolveGoogleRedirects?: boolean;
   } = {},
 ): Promise<SearchResult> {
@@ -1070,7 +1050,7 @@ export async function googleSearch(
 
 // If the extraction returned an HTTP-error marker (set by runInPageSession
 // when the server responded 4xx/5xx), convert it to a SearchResult that
-// carries the status — so the tool layer can surface it as an error instead
+// carries the status - so the tool layer can surface it as an error instead
 // of returning the error-page content as if it were the page itself.
 function resolveHttpError(markdown: string, url: string): SearchResult {
   const httpErr = markdown.match(/^__HTTP_ERROR__: (\d{3})\s*(.*)$/);
@@ -1135,7 +1115,7 @@ export async function shutdownChrome(): Promise<void> {
   await withChromeLifecycle(() => stopChrome());
 }
 
-// Exported for testing — internal API, not part of the extension's tool surface
+// Exported for testing - internal API, not part of the extension's tool surface
 // (index.ts only re-exports googleSearch, visitPage, shutdownChrome).
 // Extractor JS strings + URL classifiers are re-exported from ./extractors.ts
 // so existing test imports from chrome.ts keep working.

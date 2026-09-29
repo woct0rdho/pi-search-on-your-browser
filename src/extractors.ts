@@ -1,24 +1,22 @@
-/**
- * JavaScript extractors + URL classifiers for visit_page / google_search.
- *
- * Each extractor is a self-contained JS string (run via CDP
- * `Runtime.evaluate` in the page's main execution context). They're kept as
- * strings — not real TypeScript — because they execute in the browser, not
- * Node, and can't be type-checked or linted here. The tests in
- * `tests/unit/extractors-parse.test.ts` validate they at least parse as valid
- * JavaScript via `new Function()`.
- *
- * Split from `chrome.ts` so the CDP plumbing (which changes rarely) is
- * isolated from the site-specific extractors (which change whenever a site
- * redesigns its DOM). This module has zero dependency on the CDP layer —
- * it's pure data + pure functions.
- */
+// JavaScript extractors + URL classifiers for visit_page / google_search.
+//
+// Each extractor is a self-contained JS string (run via CDP
+// `Runtime.evaluate` in the page's main execution context). They're kept as
+// strings - not real TypeScript - because they execute in the browser, not
+// Node, and can't be type-checked or linted here. The tests in
+// `tests/unit/extractors-parse.test.ts` validate they at least parse as valid
+// JavaScript via `new Function()`.
+//
+// Split from `chrome.ts` so the CDP plumbing (which changes rarely) is
+// isolated from the site-specific extractors (which change whenever a site
+// redesigns its DOM). This module has zero dependency on the CDP layer -
+// it's pure data + pure functions.
 
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// ── Google consent + search ───────────────────────────────────────────────
+// Google consent + search
 
 // Backtick constant for building JS strings that contain backticks
 const BT = "`";
@@ -41,7 +39,7 @@ export const GOOGLE_CONSENT_JS =
 // unwrapped locally when the target is a plain URL. The newer
 // `/goto?url=<opaque token>` wrapper is a Tink-encrypted protobuf that cannot be
 // decoded offline, so those links are kept as-is and resolved afterwards in the
-// browser (HTTP 302 Location) by src/google-links.ts — never dropped.
+// browser (HTTP 302 Location) by src/google-links.ts - never dropped.
 export const GOOGLE_SEARCH_JS =
   "(() => {" +
   'const clean=s=>(s||"").replace(/\\s+/g," ").trim();' +
@@ -64,7 +62,7 @@ export const GOOGLE_SEARCH_JS =
   'return lines.join("\\n");' +
   "})()";
 
-// ── Generic page extractor (fallback / default) ───────────────────────────
+// Generic page extractor (fallback / default)
 
 export const EXTRACT_PAGE_JS =
   "(() => {" +
@@ -97,16 +95,16 @@ export const EXTRACT_PAGE_JS =
   'return lines.join("\\n");' +
   "})()";
 
-// ── Defuddle (clean article extraction) ─────────────────────────────────
+// Defuddle (clean article extraction)
 // A vendored, self-contained UMD bundle of Defuddle (MIT, by Steph Ango /
-// @kepano) — the same library the Obsidian Web Clipper uses. When injected
+// @kepano) - the same library the Obsidian Web Clipper uses. When injected
 // into a page, it exposes `window.Defuddle`, which extracts the page's main
 // article content (reader-mode style: drops nav, sidebars, ads, footers) and
 // converts it to clean Markdown via the bundled Turndown engine.
 //
 // This is far cleaner than EXTRACT_PAGE_JS (the naive block-walker fallback)
 // for articles, docs, and blog posts: no navigation noise, no "visible links"
-// dump, no 90 KB truncation cliff — just the article content as Markdown.
+// dump, no 90 KB truncation cliff - just the article content as Markdown.
 //
 // See src/vendor/README.md for build provenance and license attribution.
 const DEFUDDLE_BUNDLE_PATH = join(
@@ -142,7 +140,7 @@ export const DEFUDDLE_DRIVER_JS = `(() => {
     if (r.published) meta.push(r.published);
     if (r.wordCount) meta.push(r.wordCount + " words");
     if (r.site) meta.push(r.site);
-    if (meta.length) { lines.push(""); lines.push(meta.join(" · ")); }
+    if (meta.length) { lines.push(""); lines.push(meta.join(" - ")); }
     lines.push("");
     lines.push(content);
     return lines.join("\\n");
@@ -151,14 +149,14 @@ export const DEFUDDLE_DRIVER_JS = `(() => {
   }
 })()`;
 
-// ── X (Twitter) extractor ────────────────────────────────────────────────
+// X (Twitter) extractor
 // Search results, profiles, and individual tweets all render tweets as
 // <article data-testid="tweet">. Written as a template literal for readability
 // (no backticks needed inside), unlike the Google/generic extractors above.
 //
 // X virtualizes its timeline: only a window of tweets is mounted in the DOM at
 // any time, and scrolling past evicts earlier ones. So this extractor is async
-// and self-scrolling — it collects the currently-mounted tweets, scrolls to
+// and self-scrolling - it collects the currently-mounted tweets, scrolls to
 // load more, and repeats, deduping by permalink. Tweets that get unmounted as
 // we scroll past them are already captured in `seen`.
 export const X_EXTRACT_JS = `(async () => {
@@ -222,9 +220,9 @@ export const X_EXTRACT_JS = `(async () => {
   if (tweets.length === 0) {
     const bodyText = (document.body.innerText || "").slice(0, 2000);
     if (/something went wrong|try reloading|algo sali/i.test(bodyText)) {
-      lines.push("_X returned an error (\\"Something went wrong. Try reloading.\\"). This is usually a transient rate-limit — wait a minute and retry, or open the URL in the visible Chrome window and reload._");
+      lines.push("_X returned an error (\\"Something went wrong. Try reloading.\\"). This is usually a transient rate-limit - wait a minute and retry, or open the URL in the visible Chrome window and reload._");
     } else if (/log in|iniciar sesi|connexion/i.test(bodyText)) {
-      lines.push("_No tweets found — the page is showing a login wall. Log in to X in the visible Chrome window (profile at ~/.pi-search-browser/) and retry._");
+      lines.push("_No tweets found - the page is showing a login wall. Log in to X in the visible Chrome window (profile at ~/.pi-search-browser/) and retry._");
     } else {
       lines.push("_No tweets found. The search may have yielded no results, or the page failed to render._");
     }
@@ -232,11 +230,11 @@ export const X_EXTRACT_JS = `(async () => {
   }
   for (const t of tweets) {
     const link = t.permalink ? "https://x.com" + t.permalink : "";
-    lines.push("### @" + t.handle + (t.name ? " — " + t.name : ""));
+    lines.push("### @" + t.handle + (t.name ? " - " + t.name : ""));
     const meta = [];
     if (t.time) meta.push(t.time);
     if (link) meta.push(link);
-    if (meta.length) lines.push(meta.join(" · "));
+    if (meta.length) lines.push(meta.join(" - "));
     lines.push("");
     lines.push(t.text || "(no text)");
     lines.push("");
@@ -244,7 +242,7 @@ export const X_EXTRACT_JS = `(async () => {
     if (t.reply) eng.push(t.reply);
     if (t.retweet) eng.push(t.retweet);
     if (t.like) eng.push(t.like);
-    if (eng.length) lines.push("_" + eng.join(" · ") + "_");
+    if (eng.length) lines.push("_" + eng.join(" - ") + "_");
     lines.push("");
     lines.push("---");
     lines.push("");
@@ -252,7 +250,7 @@ export const X_EXTRACT_JS = `(async () => {
   return lines.join("\\n");
 })()`;
 
-// ── Reddit extractor ─────────────────────────────────────────────────────
+// Reddit extractor
 // Post + comment pages render the post as <shreddit-post> and each comment as
 // <shreddit-comment>, which carries author/depth/score/created as attributes.
 // The generic extractor misses these (no <p>/<li> structure) and flattens
@@ -265,7 +263,7 @@ export const REDDIT_EXTRACT_JS = `(async () => {
   const cleanMulti = s => (s||"").replace(/[ \\t]+/g, " ").replace(/\\n{3,}/g, "\\n\\n").trim();
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // ── Post ──
+  // Post
   const post = document.querySelector('shreddit-post, [data-testid="post-container"]');
   const titleEl = post ? post.querySelector('[slot="title"], h1, [data-testid="post-title"]') : null;
   const title = clean(titleEl ? titleEl.innerText : document.title);
@@ -277,7 +275,7 @@ export const REDDIT_EXTRACT_JS = `(async () => {
   const postBodyEl = post ? post.querySelector('[slot="text-body"], .md, [data-testid="post-text"]') : null;
   const postBody = cleanMulti(postBodyEl ? postBodyEl.innerText : "");
 
-  // ── Comments (incremental scroll, dedup by thingid) ──
+  // Comments (incremental scroll, dedup by thingid)
   const seen = new Map();
   let stale = 0;
   for (let i = 0; i < 10; i++) {
@@ -302,7 +300,7 @@ export const REDDIT_EXTRACT_JS = `(async () => {
   }
   window.scrollTo(0, 0);
 
-  // ── Build markdown ──
+  // Build markdown
   const lines = [];
   lines.push("# " + (title || "Reddit post"));
   lines.push("");
@@ -311,7 +309,7 @@ export const REDDIT_EXTRACT_JS = `(async () => {
   if (subreddit) pm.push("r/" + subreddit);
   if (author) pm.push("u/" + author);
   if (postScore) pm.push(postScore + " points");
-  if (pm.length) { lines.push(""); lines.push(pm.join(" · ")); }
+  if (pm.length) { lines.push(""); lines.push(pm.join(" - ")); }
   if (postBody) { lines.push(""); lines.push(postBody); }
   lines.push("");
   lines.push("## Comments (" + seen.size + ")");
@@ -334,7 +332,7 @@ export const REDDIT_EXTRACT_JS = `(async () => {
   return lines.join("\\n");
 })()`;
 
-// ── Amazon extractor ─────────────────────────────────────────────────────
+// Amazon extractor
 // Amazon product pages are extremely noisy: the generic extractor pulls
 // ~110KB of nav, keyboard-shortcut help, and category links before reaching
 // the actual product data (and truncates at 90KB, often losing specs). This
@@ -359,12 +357,12 @@ export const AMAZON_PRODUCT_JS = `(async () => {
   const asinM = location.pathname.match(/\\/dp\\/([A-Z0-9]{10})/);
   const asin = asinM ? asinM[1] : null;
 
-  // Feature bullets — deduped (Amazon sometimes repeats them)
+  // Feature bullets - deduped (Amazon sometimes repeats them)
   const bset = new Set(); const bullets = [];
   for (const el of document.querySelectorAll("#feature-bullets ul li span.a-list-item")) {
     const t = clean(el.innerText); if (!t || bset.has(t)) continue; bset.add(t); bullets.push(t);
   }
-  // Tech specs — prefer the table, fall back to detail bullets
+  // Tech specs - prefer the table, fall back to detail bullets
   const specs = []; const sset = new Set();
   for (const tr of document.querySelectorAll("#productDetails_techSpec_section_1 tr, #techSpecTable tr")) {
     const th = tr.querySelector("th"); const td = tr.querySelector("td");
@@ -377,7 +375,7 @@ export const AMAZON_PRODUCT_JS = `(async () => {
   }
   const description = txt("#productDescription");
 
-  // Reviews are lazy-loaded near the bottom — best-effort scroll to find a few
+  // Reviews are lazy-loaded near the bottom - best-effort scroll to find a few
   let reviews = [];
   for (let i = 0; i < 4; i++) {
     const els = [...document.querySelectorAll('[data-hook="review-body"] span')];
@@ -477,23 +475,23 @@ export const AMAZON_SEARCH_JS = `(async () => {
     const parts = [];
     if (r.price) parts.push(r.price);
     if (r.rating) parts.push(r.rating);
-    lines.push("- **" + (r.title || "(no title)") + (r.sponsored ? " [Sponsored]" : "") + "**" + (parts.length ? " — " + parts.join(" | ") : ""));
+    lines.push("- **" + (r.title || "(no title)") + (r.sponsored ? " [Sponsored]" : "") + "**" + (parts.length ? " - " + parts.join(" | ") : ""));
     lines.push("  " + r.url);
   }
   return lines.join("\\n");
 })()`;
 
-// ── Google Scholar extractor ──────────────────────────────────────────────
+// Google Scholar extractor
 // Scholar search pages (scholar.google.com/scholar?q=...) render results as
 // .gs_r blocks, each with .gs_ri (info) containing .gs_rt (title+link), .gs_a
 // (authors/year/venue), .gs_rs (snippet), and .gs_fl (footer links: Cited by,
 // Related, Versions). The generic extractor flattens these into H3 headers and
-// loses the authors, snippets, citation counts, and PDF links — the data that
+// loses the authors, snippets, citation counts, and PDF links - the data that
 // matters for academic search. Scholar paginates (10 results/page) rather than
 // infinite-scrolling, so this is synchronous like GOOGLE_SEARCH_JS (no async
 // scroll loop). The dedicated Chrome profile carries any locale setting, so
 // the citation footer text varies ("Cited by 1108" / "Cité 1108 fois" /
-// "Citado por 1108" / "Zitiert von 1108") — matched with a locale-agnostic
+// "Citado por 1108" / "Zitiert von 1108") - matched with a locale-agnostic
 // regex.
 export const SCHOLAR_EXTRACT_JS = `(() => {
   const clean = s => (s||"").replace(/\\s+/g, " ").trim();
@@ -540,19 +538,19 @@ export const SCHOLAR_EXTRACT_JS = `(() => {
   for (const r of results) {
     i++;
     lines.push(i + ". **" + r.title + "**");
-    if (r.meta) lines.push("   " + r.meta + (r.cited ? " · Cited by " + r.cited : ""));
+    if (r.meta) lines.push("   " + r.meta + (r.cited ? " - Cited by " + r.cited : ""));
     else if (r.cited) lines.push("   Cited by " + r.cited);
     if (r.snip) lines.push("   " + r.snip);
     const links = [];
     if (r.href) links.push("[Article](" + r.href + ")");
     if (r.pdf) links.push("[PDF](" + r.pdf + ")");
-    if (links.length) lines.push("   " + links.join(" · "));
+    if (links.length) lines.push("   " + links.join(" - "));
     lines.push("");
   }
   return lines.join("\\n");
 })()`;
 
-// ── URL classifiers ───────────────────────────────────────────────────────
+// URL classifiers
 // Used by visitPage() to route URLs to the right specialized extractor.
 // Specialized extractors produce far cleaner, more structured markdown than
 // the generic block-walker; the classifiers ensure each is only used on the
@@ -573,7 +571,7 @@ export function isRedditPostUrl(url: string): boolean {
     const u = new URL(url);
     const host = u.hostname.toLowerCase();
     const isReddit = host === "reddit.com" || host.endsWith(".reddit.com");
-    // Only post/comment pages — listings and user pages use the generic extractor.
+    // Only post/comment pages - listings and user pages use the generic extractor.
     return isReddit && u.pathname.includes("/comments/");
   } catch {
     return false;
@@ -606,7 +604,7 @@ export function isScholarSearchUrl(url: string): boolean {
   try {
     const u = new URL(url);
     const host = u.hostname.toLowerCase();
-    // scholar.google.com (any TLD) — search and citation pages both use /scholar
+    // scholar.google.com (any TLD) - search and citation pages both use /scholar
     return host === "scholar.google.com" || host.endsWith(".scholar.google.com");
   } catch {
     return false;

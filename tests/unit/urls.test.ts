@@ -8,7 +8,7 @@ import {
   isScholarSearchUrl,
 } from "../../src/extractors.ts";
 
-// ── isXUrl ─────────────────────────────────────────────────────────────────
+// isXUrl
 
 test("isXUrl: matches x.com and twitter.com with any path", () => {
   for (const url of [
@@ -37,7 +37,7 @@ test("isXUrl: rejects non-X hosts and look-alike domains", () => {
   }
 });
 
-// ── isRedditPostUrl ─────────────────────────────────────────────────────────
+// isRedditPostUrl
 
 test("isRedditPostUrl: matches post/comment pages (path contains /comments/)", () => {
   for (const url of [
@@ -64,7 +64,7 @@ test("isRedditPostUrl: rejects listings, user pages, and non-reddit", () => {
   }
 });
 
-// ── isAmazonProductUrl ─────────────────────────────────────────────────────
+// isAmazonProductUrl
 
 test("isAmazonProductUrl: matches /dp/ASIN, /gp/product/ASIN, /gp/aw/d/ASIN across TLDs", () => {
   for (const url of [
@@ -92,7 +92,7 @@ test("isAmazonProductUrl: rejects search URLs, non-amazon, and malformed ASINs",
   }
 });
 
-// ── isAmazonSearchUrl ──────────────────────────────────────────────────────
+// isAmazonSearchUrl
 
 test("isAmazonSearchUrl: matches /s?k=... across TLDs", () => {
   for (const url of [
@@ -118,7 +118,7 @@ test("isAmazonSearchUrl: rejects product URLs, missing k param, non-amazon", () 
   }
 });
 
-// ── isScholarSearchUrl ─────────────────────────────────────────────────────
+// isScholarSearchUrl
 
 test("isScholarSearchUrl: matches scholar.google.com with any path", () => {
   for (const url of [

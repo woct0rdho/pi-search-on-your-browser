@@ -5,23 +5,23 @@ software, used by the `clean` extraction mode of `visit_page`.
 
 ## defuddle-browser.js
 
-A self-contained UMD bundle of [**Defuddle**](https://github.com/kepano/defuddle)
+A self-contained UMD bundle of [Defuddle](https://github.com/kepano/defuddle)
 (MIT License, © 2025 Steph Ango / @kepano), which extracts the main article
-content from a web page and converts it to clean Markdown — the same library
+content from a web page and converts it to clean Markdown - the same library
 used by the [Obsidian Web Clipper](https://github.com/obsidianmd/obsidian-clipper).
 
 This slim build was produced from the defuddle source with the following
 webpack-equivalent configuration:
 
-- **Entry:** `src/index.full.ts` (exports `Defuddle` + `createMarkdownContent`).
-- **Math module:** the *core* stub (`src/elements/math.core.ts`) instead of the
+- Entry: `src/index.full.ts` (exports `Defuddle` + `createMarkdownContent`).
+- Math module: the *core* stub (`src/elements/math.core.ts`) instead of the
   *full* one. The full build bundles `temml` (~300 KB) and `mathml-to-latex`
-  for server-side MathML→LaTeX conversion; the core stub keeps existing
+  for server-side MathML->LaTeX conversion; the core stub keeps existing
   MathML/ LaTeX intact without those dependencies, which is sufficient for
   browser extraction (the browser already rendered the math).
-- **Turndown** (MIT, © 2017 Dom Christie) is bundled in — it is the HTML→Markdown
+- Turndown (MIT, © 2017 Dom Christie) is bundled in - it is the HTML->Markdown
   engine defuddle uses internally.
-- `linkedom` (a server-side DOM polyfill) is **not** included — the bundle runs
+- `linkedom` (a server-side DOM polyfill) is not included - the bundle runs
   in a real Chrome page where the native DOM is available.
 
 ### How it was built

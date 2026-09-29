@@ -5,9 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   validateReasoningLevel,
-  buildReasoningParams,
   truncateForContext,
-  buildMessages,
+  buildSummaryPrompt,
   configSummary,
   config as __config,
   normalizeProxy,
@@ -16,23 +15,9 @@ import {
   saveConfigFile,
   setConfigDir,
   configPath,
-  SUBAGENT_SYSTEM_PROMPT,
-  type SubagentModel,
 } from "../../src/subagent.ts";
 
-// Minimal model fixtures. truncateForContext / buildReasoningParams only read
-// the fields below, so a partial object is sufficient.
-function model(overrides: Partial<SubagentModel> = {}): SubagentModel {
-  return {
-    id: "test-model",
-    baseUrl: "https://api.example.com/v1",
-    reasoning: false,
-    contextWindow: 8000,
-    ...overrides,
-  };
-}
-
-// ── validateReasoningLevel ────────────────────────────────────────────────
+// validateReasoningLevel
 
 test("validateReasoningLevel: accepts all valid levels (case-insensitive)", () => {
   for (const lvl of ["off", "minimal", "low", "medium", "high", "xhigh"]) {
@@ -48,88 +33,21 @@ test("validateReasoningLevel: rejects unknown and empty", () => {
   assert.equal(validateReasoningLevel("ultra"), undefined);
 });
 
-// ── buildReasoningParams ──────────────────────────────────────────────────
-
-test("buildReasoningParams: returns undefined for non-reasoning model", () => {
-  assert.equal(buildReasoningParams(model({ reasoning: false }), "high"), undefined);
-});
-
-test("buildReasoningParams: default format uses reasoning_effort", () => {
-  const params = buildReasoningParams(model({ reasoning: true }), "high");
-  assert.deepEqual(params, { reasoning_effort: "high" });
-});
-
-test("buildReasoningParams: default format with 'off' returns undefined (not reasoning_effort: 'off')", () => {
-  // 'off' must not be sent as reasoning_effort — many APIs (vLLM, OpenAI)
-  // reject it. Mirror pi: don't send the param when reasoning is off.
-  const params = buildReasoningParams(model({ reasoning: true }), "off");
-  assert.equal(params, undefined);
-});
-
-test("buildReasoningParams: openrouter format uses reasoning.effort", () => {
-  const params = buildReasoningParams(
-    model({ reasoning: true, compat: { thinkingFormat: "openrouter" } }),
-    "medium",
-  );
-  assert.deepEqual(params, { reasoning: { effort: "medium" } });
-});
-
-test("buildReasoningParams: openrouter format with 'off' sends effort: 'none'", () => {
-  // Mirror pi's OpenRouter path: falsy reasoning → effort: "none".
-  const params = buildReasoningParams(
-    model({ reasoning: true, compat: { thinkingFormat: "openrouter" } }),
-    "off",
-  );
-  assert.deepEqual(params, { reasoning: { effort: "none" } });
-});
-
-test("buildReasoningParams: qwen format uses enable_thinking boolean", () => {
-  const on = buildReasoningParams(
-    model({ reasoning: true, compat: { thinkingFormat: "qwen" } }),
-    "high",
-  );
-  assert.deepEqual(on, { enable_thinking: true });
-
-  const off = buildReasoningParams(
-    model({ reasoning: true, compat: { thinkingFormat: "qwen" } }),
-    "off",
-  );
-  assert.deepEqual(off, { enable_thinking: false });
-});
-
-test("buildReasoningParams: thinkingLevelMap null skips params entirely", () => {
-  // Some providers mark certain levels as unsupported via null.
-  const params = buildReasoningParams(
-    model({ reasoning: true, thinkingLevelMap: { high: null } }),
-    "high",
-  );
-  assert.equal(params, undefined);
-});
-
-test("buildReasoningParams: thinkingLevelMap remaps level", () => {
-  const params = buildReasoningParams(
-    model({ reasoning: true, thinkingLevelMap: { high: "max" } }),
-    "high",
-  );
-  assert.deepEqual(params, { reasoning_effort: "max" });
-});
-
-// ── truncateForContext ────────────────────────────────────────────────────
+// truncateForContext
+// The context window is the model's `contextWindow` number; the subagent
+// layer no longer carries a model object.
 
 test("truncateForContext: returns content unchanged when it fits", () => {
-  const m = model({ contextWindow: 8000 }); // ~lots of room
   const content = "x".repeat(1000);
-  const out = truncateForContext(content, m, 2048);
+  const out = truncateForContext(content, 8000, 2048); // ~lots of room
   assert.equal(out.truncated, false);
   assert.equal(out.content, content);
   assert.equal(out.originalChars, 1000);
 });
 
 test("truncateForContext: truncates when content exceeds context window", () => {
-  // Tiny context window forces truncation.
-  const m = model({ contextWindow: 500 });
   const content = "x".repeat(10_000);
-  const out = truncateForContext(content, m, 256);
+  const out = truncateForContext(content, 500, 256); // tiny context forces truncation
   assert.equal(out.truncated, true);
   assert.equal(out.originalChars, 10_000);
   assert.ok(out.content.length < 10_000, "truncated content should be smaller");
@@ -140,12 +58,11 @@ test("truncateForContext: truncates when content exceeds context window", () => 
 });
 
 test("truncateForContext: reserves room for maxTokens", () => {
-  // Same content + context window, but larger maxTokens → less room for content.
-  const m = model({ contextWindow: 4000 });
+  // Same content + context window, but larger maxTokens -> less room for content.
   const content = "y".repeat(20_000);
-  const small = truncateForContext(content, m, 256);
-  const large = truncateForContext(content, m, 3000);
-  // Larger maxTokens reservation → smaller available content budget.
+  const small = truncateForContext(content, 4000, 256);
+  const large = truncateForContext(content, 4000, 3000);
+  // Larger maxTokens reservation -> smaller available content budget.
   assert.ok(
     large.content.length <= small.content.length,
     `larger maxTokens should leave less room (got ${large.content.length} vs ${small.content.length})`,
@@ -153,39 +70,36 @@ test("truncateForContext: reserves room for maxTokens", () => {
 });
 
 test("truncateForContext: empty content passes through untouched", () => {
-  const out = truncateForContext("", model({ contextWindow: 1000 }), 100);
+  const out = truncateForContext("", 1000, 100);
   assert.equal(out.truncated, false);
   assert.equal(out.content, "");
   assert.equal(out.originalChars, 0);
 });
 
-// ── buildMessages ─────────────────────────────────────────────────────────
+// buildSummaryPrompt
+// The prompt is sent as the user message; the system prompt is passed
+// separately as `context.systemPrompt` to Pi's provider-neutral stream API.
 
-test("buildMessages: produces system + user messages with URL and content", () => {
-  const msgs = buildMessages("https://example.com/page", "Hello world");
-  assert.equal(msgs.length, 2);
-  assert.equal(msgs[0].role, "system");
-  assert.equal(msgs[0].content, SUBAGENT_SYSTEM_PROMPT);
-  assert.equal(msgs[1].role, "user");
-  assert.ok(msgs[1].content.includes("https://example.com/page"));
-  assert.ok(msgs[1].content.includes("Hello world"));
-  assert.ok(msgs[1].content.includes("PAGE CONTENT"));
-  assert.ok(msgs[1].content.includes("Summarize"));
+test("buildSummaryPrompt: includes URL, content, and the summarize instruction", () => {
+  const prompt = buildSummaryPrompt("https://example.com/page", "Hello world");
+  assert.ok(prompt.includes("https://example.com/page"));
+  assert.ok(prompt.includes("Hello world"));
+  assert.ok(prompt.includes("PAGE CONTENT"));
+  assert.ok(prompt.includes("Summarize"));
 });
 
-test("buildMessages: content is wrapped between delimiters", () => {
-  const msgs = buildMessages("https://ex.com", "BODY");
-  const user = msgs[1].content;
-  const before = user.indexOf("---\n");
-  const after = user.indexOf("\n---", before + 1);
+test("buildSummaryPrompt: content is wrapped between delimiters", () => {
+  const prompt = buildSummaryPrompt("https://ex.com", "BODY");
+  const before = prompt.indexOf("---\n");
+  const after = prompt.indexOf("\n---", before + 1);
   assert.ok(before >= 0, "opening delimiter missing");
   assert.ok(after > before, "closing delimiter missing");
-  assert.ok(user.slice(before + 4, after).includes("BODY"), "content not between delimiters");
+  assert.ok(prompt.slice(before + 4, after).includes("BODY"), "content not between delimiters");
 });
 
-// ── configSummary: current-model fallback ─────────────────────────────────
+// configSummary: current-model fallback
 // The key behavior change in v0.7: when no provider/model is pinned, the
-// subagent reuses the current session model — configSummary should make that
+// subagent reuses the current session model - configSummary should make that
 // visible instead of showing "(not set)".
 
 test("configSummary: shows current model when no override is configured", () => {
@@ -219,7 +133,7 @@ test("configSummary: shows (none) when no override and no current model", () => 
   assert.ok(summary.includes("(none"), "should indicate no model available");
 });
 
-// ── Chrome proxy configuration ────────────────────────────────────────────
+// Chrome proxy configuration
 // The proxy is handed to Chrome as --proxy-server when the browser is
 // launched (see chrome.ts), so on machines that need a proxy to reach the
 // internet google_search / visit_page keep working. These tests pin down how
@@ -246,7 +160,7 @@ test("normalizeProxy: off switches and invalid values yield undefined", () => {
   }
 });
 
-/** Run `fn` with the config file pointed at a throwaway agent dir. */
+// Run `fn` with the config file pointed at a throwaway agent dir.
 function withTempConfigDir(fn: (dir: string) => void): void {
   const originalDir = dirname(configPath());
   const originalProxyEnv = process.env.PI_SEARCH_PROXY;
@@ -353,9 +267,9 @@ test("configSummary: shows the effective Chrome proxy", () => {
   }
 });
 
-// ── summary-mode configuration (`summaryEnabled`) ─────────────────────────
-// `summaryEnabled: false` does not disable visit_page — ``url``/``clean`` keep
-// working — it is what makes index.ts hide the `summary` option from the model
+// summary-mode configuration (`summaryEnabled`)
+// `summaryEnabled: false` does not disable visit_page - ``url``/``clean`` keep
+// working - it is what makes index.ts hide the `summary` option from the model
 // entirely (no parameter, no description/guideline mention). These tests pin
 // down how the flag is read and what /browse reports.
 
@@ -439,7 +353,7 @@ test("configSummary: reports the hidden summary option when disabled", () => {
   }
 });
 
-// ── clean-mode configuration (`cleanEnabled`) ─────────────────────────────
+// clean-mode configuration (`cleanEnabled`)
 // Clean mode is toggled independently of summary mode: `cleanEnabled: false`
 // hides the `clean` option from the model without affecting `summary` (and
 // vice versa). Same resolution rules as summaryEnabled.

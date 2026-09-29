@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { runInPageSession, CHROME_LAUNCH_ARGS, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
 
-// ── Fake CDP ───────────────────────────────────────────────────────────────
+// Fake CDP
 // Implements CDPLike so runInPageSession can be exercised without a real
 // browser or WebSocket. Records every call/evaluate for assertions.
 
@@ -13,58 +13,58 @@ interface FakeDocResponse {
   statusText?: string;
   url?: string;
   frameId?: string;
-  /** Emit the commit event as an iframe (parentId set) instead of the main frame. */
+  // Emit the commit event as an iframe (parentId set) instead of the main frame.
   iframe?: boolean;
-  /** Mark the response as a Cloudflare challenge (`cf-mitigated: challenge`). */
+  // Mark the response as a Cloudflare challenge (`cf-mitigated: challenge`).
   challenge?: boolean;
-  /** Emit this response after a delay (settles in the background). */
+  // Emit this response after a delay (settles in the background).
   delayMs?: number;
 }
 
 class FakeCDP implements CDPLike {
   calls: Array<{ method: string; params?: Record<string, unknown>; timeoutMs?: number }> = [];
   evaluations: string[] = [];
-  /** Per-expression results. If an expression is in this map, evaluate()
-   *  returns the mapped value instead of extractionResult. Lets tests
-   *  distinguish primary vs fallback JS results. */
+  // Per-expression results. If an expression is in this map, evaluate()
+  // returns the mapped value instead of extractionResult. Lets tests
+  // distinguish primary vs fallback JS results.
   evaluateResults: Map<string, string> = new Map();
-  /** What waitForSelector polls return: "true" (found) or "false" (absent). */
+  // What waitForSelector polls return: "true" (found) or "false" (absent).
   selectorFound = false;
-  /** What the final extractor evaluate returns. */
+  // What the final extractor evaluate returns.
   extractionResult = "extracted content";
-  /** HTTP status to simulate for the main document response. Set before
-   *  calling runInPageSession to make Page.navigate emit a
-   *  Network.responseReceived event with this status. 0 = don't emit.
-   *  Ignored when `docSequence` is non-empty. */
+  // HTTP status to simulate for the main document response. Set before
+  // calling runInPageSession to make Page.navigate emit a
+  // Network.responseReceived event with this status. 0 = don't emit.
+  // Ignored when `docSequence` is non-empty.
   docResponseStatus = 0;
   docResponseStatusText = "";
-  /** Document responses emitted for Page.navigate, in order. Use for
-   *  interstitials (403 then 200) and iframe filtering; `delayMs` simulates a
-   *  response that arrives after the challenge solved itself. */
+  // Document responses emitted for Page.navigate, in order. Use for
+  // interstitials (403 then 200) and iframe filtering; `delayMs` simulates a
+  // response that arrives after the challenge solved itself.
   docSequence: FakeDocResponse[] = [];
-  /** Document responses emitted for Page.reload (same shape as docSequence). */
+  // Document responses emitted for Page.reload (same shape as docSequence).
   reloadSequence: FakeDocResponse[] = [];
-  /** Main-frame id attached to sequence entries that don't set `frameId`. */
+  // Main-frame id attached to sequence entries that don't set `frameId`.
   mainFrameId = "F-MAIN";
-  /** Value returned by the challenge probe (document.title ...). Empty means
-   *  "not a challenge page". */
+  // Value returned by the challenge probe (document.title ...). Empty means
+  // "not a challenge page".
   titleProbeText = "";
-  /** How many upcoming Page.navigate calls fail with a timeout (simulates a
-   *  stalled browser/proxy). Set before runInPageSession. */
+  // How many upcoming Page.navigate calls fail with a timeout (simulates a
+  // stalled browser/proxy). Set before runInPageSession.
   navigateTimeouts = 0;
-  /** Error text used for those failures. */
+  // Error text used for those failures.
   navigateTimeoutMessage = "CDP call timeout: Page.navigate";
-  /** When true, Page.navigate never answers — but the page still loads, which
-   *  is what a slow navigation looks like when the load event fires first. */
+  // When true, Page.navigate never answers - but the page still loads, which
+  // is what a slow navigation looks like when the load event fires first.
   navigateHangs = false;
   private loadHandlers: Array<(params: unknown) => void> = [];
   private networkHandlers: Array<(params: unknown) => void> = [];
   private frameHandlers: Array<(params: unknown) => void> = [];
-  /** URL of the last Page.navigate, used when a sequence entry omits `url`. */
+  // URL of the last Page.navigate, used when a sequence entry omits `url`.
   private lastNavigateUrl = "https://example.com/page";
 
-  /** Emit one Document response plus the commit that follows it (real CDP
-   *  order: Network.responseReceived → Page.frameNavigated). */
+  // Emit one Document response plus the commit that follows it (real CDP
+  // order: Network.responseReceived -> Page.frameNavigated).
   private emitDocResponse(spec: FakeDocResponse, url: string): void {
     const frameId = spec.frameId ?? this.mainFrameId;
     const responseUrl = spec.url ?? url;
@@ -129,7 +129,7 @@ class FakeCDP implements CDPLike {
   async evaluate(expression: string): Promise<string> {
     this.evaluations.push(expression);
     // waitForSelector polls look like: document.querySelector("...") !== null
-    // cdp.evaluate stringifies the boolean → "true" / "false" (the bug source).
+    // cdp.evaluate stringifies the boolean -> "true" / "false" (the bug source).
     if (expression.startsWith("document.querySelector")) {
       return this.selectorFound ? "true" : "false";
     }
@@ -161,9 +161,9 @@ function baseOpts(overrides: Partial<RunInPageOptions> = {}): RunInPageOptions {
   };
 }
 
-// ── The regression test ────────────────────────────────────────────────────
+// The regression test
 // This is the exact bug fixed in v0.5.1: cdp.evaluate() stringifies its return
-// value via String(value), so the boolean false became the string "false" —
+// value via String(value), so the boolean false became the string "false" -
 // which is TRUTHY. The old code did `if (found) break`, breaking on the first
 // poll regardless of whether the selector existed. Fix: `if (found === "true")`.
 
@@ -181,8 +181,8 @@ test("waitForSelector does NOT break on first poll when selector absent (v0.5.1 
     e.startsWith("document.querySelector"),
   ).length;
 
-  // With the old buggy code, found = "false" (truthy) → break after 1 poll.
-  // The fix (found === "true") keeps polling → multiple polls.
+  // With the old buggy code, found = "false" (truthy) -> break after 1 poll.
+  // The fix (found === "true") keeps polling -> multiple polls.
   assert.ok(
     selectorPolls > 1,
     `expected multiple selector polls (bug would give 1), got ${selectorPolls}`,
@@ -225,7 +225,7 @@ test("waitForSelector times out (and keeps polling) when selector never appears"
   assert.ok(elapsed >= 150, `should wait ~timeout duration, took ${elapsed}ms`);
 });
 
-// ── Navigation & extraction ────────────────────────────────────────────────
+// Navigation & extraction
 
 test("navigation enables Page + Network (never Runtime) and then navigates", async () => {
   const fake = new FakeCDP();
@@ -268,7 +268,7 @@ test("dynamicScroll issues scroll evaluations", async () => {
   assert.equal(scrolls.length, 4, `expected 4 scroll evaluations, got ${scrolls.length}`);
 });
 
-// ── bringToFront (background-tab scrolling fix) ───────────────────────────
+// bringToFront (background-tab scrolling fix)
 // Tool tabs open in the background; Chrome suspends the renderer of
 // non-active tabs, so scrolling (dynamicScroll + the self-scrolling inside
 // the async extractors) can't trigger lazy-loaded content. The fix: call CDP
@@ -315,7 +315,7 @@ test("bringToFront is called AFTER navigation but BEFORE scrolling", async () =>
   assert.ok(btfIdx > navIdx, `bringToFront (${btfIdx}) should come after navigate (${navIdx})`);
   // bringToFront must come before the first scroll evaluation. Calls and
   // evaluations are interleaved in call order, so verify by re-running with a
-  // recorder that tracks global order — simplest: ensure scrolls exist and
+  // recorder that tracks global order - simplest: ensure scrolls exist and
   // trust the code ordering (bringToFront block precedes the scroll block).
   const scrolls = fake.evaluations.filter((e) => e.includes("window.scrollTo"));
   assert.ok(scrolls.length > 0, "scrolling should still happen after bringToFront");
@@ -371,7 +371,7 @@ test("result is truncated at MAX_RESULT_BYTES (1MB)", async () => {
   assert.ok(result.includes("[Content truncated at 1MB]"), "should have truncation marker");
 });
 
-// ── fallbackJs (Defuddle → generic extractor fallback) ─────────────────────
+// fallbackJs (Defuddle -> generic extractor fallback)
 
 test("fallbackJs runs when primary extraction returns an error marker", async () => {
   const fake = new FakeCDP();
@@ -392,7 +392,7 @@ test("fallbackJs runs when primary extraction returns an error marker", async ()
 
 test("fallbackJs runs when primary extraction returns very short content", async () => {
   const fake = new FakeCDP();
-  fake.evaluateResults.set("defuddleDriver()", "hi"); // < 50 chars → triggers fallback
+  fake.evaluateResults.set("defuddleDriver()", "hi"); // < 50 chars -> triggers fallback
   fake.evaluateResults.set("genericExtractor()", "fallback article content");
 
   const result = await runInPageSession(fake, baseOpts({
@@ -418,7 +418,7 @@ test("fallbackJs does NOT run when primary extraction succeeds", async () => {
   assert.ok(!fake.evaluations.includes("genericExtractor()"), "fallback should not run on success");
 });
 
-test("fallbackJs is not required — omitted fallback leaves result as-is", async () => {
+test("fallbackJs is not required - omitted fallback leaves result as-is", async () => {
   const fake = new FakeCDP();
   fake.evaluateResults.set("defuddleDriver()", "__DEFUDDLE_ERROR__: boom");
 
@@ -430,7 +430,7 @@ test("fallbackJs is not required — omitted fallback leaves result as-is", asyn
   assert.equal(result, "__DEFUDDLE_ERROR__: boom", "error marker passes through when no fallback");
 });
 
-// ── Defuddle driver & bundle ───────────────────────────────────────────────
+// Defuddle driver & bundle
 
 test("DEFUDDLE_DRIVER_JS parses as valid JavaScript", () => {
   // Catches template-literal escaping bugs (the \n vs real-newline class of
@@ -455,7 +455,7 @@ test("getDefuddleBundle is cached (same reference on second call)", () => {
   assert.equal(a, b, "bundle should be cached");
 });
 
-// ── HTTP error detection (4xx/5xx) ─────────────────────────────────────────
+// HTTP error detection (4xx/5xx)
 // The key fix for the Cloudflare 404 issue: when the server returns an error
 // status, runInPageSession must surface it as an __HTTP_ERROR__ marker instead
 // of silently extracting the error page's content.
@@ -486,7 +486,7 @@ test("HTTP error skips extraction entirely (no wasted JS evaluation)", async () 
     scrollDelayMs: 1,
   }));
 
-  // The extractor JS should NOT have been evaluated — the error short-circuits
+  // The extractor JS should NOT have been evaluated - the error short-circuits
   // before extraction, waitForSelector, and scrolling.
   assert.ok(!fake.evaluations.includes("myExtractor()"), "extractor should not run on HTTP error");
   const scrolls = fake.evaluations.filter((e) => e.includes("window.scrollTo"));
@@ -562,10 +562,10 @@ test("an iframe Document 403 does not override the main document's 200", async (
   assert.equal(result, "main page content, long enough to keep");
 });
 
-// ── Bot-check interstitials (403/503 that clear themselves) ───────────────
+// Bot-check interstitials (403/503 that clear themselves)
 // A fresh profile hitting a Cloudflare-protected site answered 403
 // (`cf-mitigated: challenge`) at ~3.2s and reloaded with 200 at ~7.6s. The
-// old code captured that first 403, returned an error and closed the tab —
+// old code captured that first 403, returned an error and closed the tab -
 // killing the challenge that was about to solve itself. These tests pin the
 // browser-like behavior: wait for the self-reload, or reload once.
 
@@ -657,7 +657,7 @@ test("a 404 is final immediately (no reload, no wasted evaluations)", async () =
   assert.equal(fake.evaluations.length, 0, "404 must not probe or reload");
 });
 
-// ── No stderr noise in the TUI ────────────────────────────────────────────
+// No stderr noise in the TUI
 // Pi's TUI runs in raw mode and renders raw stderr writes on the text input
 // bar, so an unconditional console.error shows up as "[pi-search] ..." while
 // the user is typing. All diagnostics live behind PI_SEARCH_DEBUG (via the
@@ -687,7 +687,7 @@ test("chrome.ts writes to stderr only behind PI_SEARCH_DEBUG", () => {
   );
 });
 
-// ── Navigation resilience (parallel tool calls / slow browsers) ──────────
+// Navigation resilience (parallel tool calls / slow browsers)
 // Real-world failure: the agent issued two visit_page calls in parallel; under
 // a slow proxy the pages took >30s, and the fixed per-call CDP timeout killed
 // one of them with "visit_page failed: CDP call timeout: Page.navigate".
@@ -772,7 +772,7 @@ test("Page.navigate passes the short timeout, other calls keep the default", asy
   assert.equal(evaluate?.timeoutMs, undefined, "non-navigate calls use the client default");
 });
 
-// ── Chrome launch flags (keep renderer alive in background) ───────────────
+// Chrome launch flags (keep renderer alive in background)
 // These flags are the difference between visit_page working with Chrome in
 // the background (window behind the terminal) vs hanging for 30s. They are
 // asserted here so a future refactor doesn't silently drop one.
@@ -788,9 +788,9 @@ test("CHROME_LAUNCH_ARGS keeps background-tab renderers alive", () => {
     "should disable renderer backgrounding");
 });
 
-// ── Browser discovery (Windows support) ──────────────────────────────────
+// Browser discovery (Windows support)
 // findChrome() used to only know Linux/macOS paths, so on Windows it fell
-// back to the bare name "google-chrome" → spawn ENOENT → uncaughtException
+// back to the bare name "google-chrome" -> spawn ENOENT -> uncaughtException
 // that killed the Pi process. These tests pin down the Windows candidates.
 
 test("chromeCandidates includes Windows Chrome install paths", () => {
@@ -845,7 +845,7 @@ test("chromeCandidates prefers CHROME_PATH and skips unset env vars", () => {
 test("findChrome returns CHROME_PATH when it exists", () => {
   const saved = { ...process.env };
   try {
-    // process.execPath always exists — good stand-in for a real binary.
+    // process.execPath always exists - good stand-in for a real binary.
     process.env.CHROME_PATH = process.execPath;
     assert.equal(findChrome(), process.execPath);
   } finally {
@@ -871,7 +871,7 @@ test("chromeSpawnErrorMessage is actionable (never a bare ENOENT crash)", () => 
   assert.ok(msg.includes("CHROME_PATH"), "should tell the user about CHROME_PATH");
 });
 
-// ── Proxy support ─────────────────────────────────────────────────────────
+// Proxy support
 // Chrome applies --proxy-server to every request, including CDP-driven
 // navigations, so this is how google_search / visit_page work on machines
 // that need a proxy to reach the internet.
@@ -899,7 +899,7 @@ test("chromeLaunchArgs keeps every base flag", () => {
 
 test("CHROME_LAUNCH_ARGS disables native window-occlusion detection", () => {
   // CalculateNativeWinOcclusion can fully freeze the renderer when the Chrome
-  // *window* is behind another window or unfocused — even with the three
+  // *window* is behind another window or unfocused - even with the three
   // flags above. This shows up as a full 30s Runtime.evaluate timeout, not
   // just missed lazy loads. Especially severe on GNOME Wayland where the
   // window cannot be programmatically focused. This is the single most

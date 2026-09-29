@@ -8,8 +8,8 @@ import {
 
 // visitPageSurface() builds the agent-facing text of visit_page from the two
 // config flags. The core invariant: a disabled feature must be invisible to
-// the model — no parameter, no description/guideline mention, no /browse hint
-// — while the rest of the surface stays identical. index.ts drops the matching
+// the model - no parameter, no description/guideline mention, no /browse hint
+// - while the rest of the surface stays identical. index.ts drops the matching
 // parameter from the schema; stripDisabledArguments covers stale arguments.
 
 const COMBOS: VisitPageOptions[] = [
@@ -95,7 +95,7 @@ test("optional parameter descriptions exist only when enabled", () => {
 
 test("the surface is the same base regardless of which optional features are on", () => {
   // The summary addition must be a suffix, and the core guidelines identical
-  // apart from the optional ones — so the variants cannot silently diverge.
+  // apart from the optional ones - so the variants cannot silently diverge.
   for (const cleanEnabled of [true, false]) {
     const without = visitPageSurface({ summaryEnabled: false, cleanEnabled });
     const with_ = visitPageSurface({ summaryEnabled: true, cleanEnabled });
@@ -145,7 +145,7 @@ test("the description stays minimal and grows monotonically with the flags", () 
     );
   }
 
-  // Base → +clean → +summary, so the surface only grows as features are on.
+  // Base -> +clean -> +summary, so the surface only grows as features are on.
   assert.ok(clean.description.startsWith(none.description));
   assert.ok(both.description.startsWith(clean.description));
   assert.ok(summary.description.startsWith(none.description));
