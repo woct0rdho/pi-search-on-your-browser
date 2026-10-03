@@ -1,17 +1,18 @@
-// Agent-facing text for `visit_page` - description, prompt snippet, prompt
-// guidelines, and parameter descriptions.
+// Agent-facing text + parameter schema for `visit_page` - description, prompt
+// snippet, prompt guidelines, and parameter descriptions.
 //
-// The two optional features are each controlled by a config flag:
-//
+// The two features are each controlled by a config flag:
 //   - `summaryEnabled` - the `summary: true` subagent mode.
 //   - `cleanEnabled`   - the `clean: true` Defuddle reader-mode extraction.
 //
-// `visitPageSurface()` builds the text for the current flags, so the tool
-// description sent to the model stays minimal and only grows as features are
-// enabled: base -> +clean -> +summary. A disabled feature must be invisible to
-// the model: no string may mention it (or point at /browse for it), and
-// index.ts drops its parameter from the schema. Keeping the strings here makes
-// that testable for every combination.
+// `visitPageSurface()` and `visitPageParameters()` build the text and schema for
+// the current flags, so what the model sees stays minimal and only grows as
+// features are enabled: base -> +clean -> +summary. A disabled feature must be
+// invisible to the model: no string may mention it (or point at /browse for
+// it), and its parameter is dropped from the schema. Keeping this here makes it
+// testable for every combination.
+
+import { Type } from "typebox";
 
 export interface VisitPageOptions {
   summaryEnabled: boolean;
@@ -53,16 +54,16 @@ const CORE_GUIDELINES = [
 ];
 
 const CLEAN_GUIDELINE =
-  "visit_page accepts a `clean` flag. For articles, docs, or blog posts, pass `clean: true` to extract only the main article content as clean Markdown (drops nav/sidebars/ads/footer) - far fewer tokens. Avoid `clean` on non-article pages (dashboards, indexes with no clear main content) where it may extract the wrong block or nothing. Note: `clean` preserves content links (article URLs, citations, story links) but drops chrome links (nav bars, sidebars, footers, action buttons) - so it's fine for gathering content links, but avoid it if you specifically need nav/footer links (e.g. finding the 'About' or 'Contact' page URL).";
+  "visit_page accepts a `clean` flag. For articles, docs, or blog posts, pass `clean: true` to extract only the main article content as clean Markdown (drops nav/sidebars/ads/footer) - far fewer tokens. Pass `clean: false` on non-article pages (dashboards, indexes with no clear main content) where it may extract the wrong block or nothing. Note: `clean` preserves content links (article URLs, citations, story links) but drops chrome links (nav bars, sidebars, footers, action buttons) - so it's fine for gathering content links, but pass `false` if you specifically need nav/footer links (e.g. finding the 'About' or 'Contact' page URL).";
 
 const SUMMARY_GUIDELINE =
-  "visit_page accepts a `summary` flag. Pass `summary: true` and the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown never enters your chat context. This keeps large pages (docs, articles, product pages) from filling the conversation. The subagent reuses your current Pi model by default (no setup needed); pin a different one with /browse. Prefer `summary` for large pages where you do not need every word verbatim. Avoid `summary` when you need verbatim text (code snippets, API signatures, exact numbers, error messages) since the subagent paraphrases; when the page is already small; or when the page content itself is the deliverable.";
+  "visit_page accepts a `summary` flag. Pass `summary: true` and the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown never enters your chat context. This keeps large pages (docs, articles, product pages) from filling the conversation. The subagent reuses your current Pi model by default (no setup needed); pin a different one with /browse. Prefer `summary` for large pages where you do not need every word verbatim. Pass `summary: false` when you need verbatim text (code snippets, API signatures, exact numbers, error messages) since the subagent paraphrases; when the page is already small; or when the page content itself is the deliverable.";
 
 const RESEARCH_GUIDELINE =
   "For research tasks - reading multiple papers, articles, or docs - use `clean: true` + `summary: true` together by default. `clean` gives the subagent pure article text (no nav noise, no 90KB truncation) so its summary is faster and more reliable; `summary` keeps each page's full content out of your context. This combination is the optimal pattern for intensive research: search -> visit each result with clean+summary -> synthesize from the concise summaries.";
 
 const CLEAN_PARAM_DESCRIPTION =
-  "Extract only the page's main article content as clean Markdown instead of the default page extraction. Drops navigation, sidebars, ads, footers, and the visible-links dump - far fewer tokens. Best for articles, docs, blog posts. Avoid on non-article pages (dashboards, indexes) where there is no clear main content. Falls back to the default extraction if no article content is found. Preserves content links (article URLs, citations) but drops chrome links (nav/footer/action buttons).";
+  "Extract only the page's main article content as clean Markdown instead of the default page extraction. Drops navigation, sidebars, ads, footers, and the visible-links dump - far fewer tokens. Best for articles, docs, blog posts. Set `false` on non-article pages (dashboards, indexes) where there is no clear main content. Falls back to the default extraction if no article content is found. Preserves content links (article URLs, citations) but drops chrome links (nav/footer/action buttons).";
 
 const SUMMARY_PARAM_BASE =
   "When true, the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown is NOT added to your chat context. Use this for large pages to keep the conversation compact. The subagent reuses your current Pi model by default; pin a different one with /browse.";
@@ -71,13 +72,13 @@ const SUMMARY_PARAM_CLEAN =
   " Combine with `clean: true` for articles (gives the subagent clean text, avoiding nav noise and truncation).";
 
 const SUMMARY_PARAM_TAIL =
-  " Avoid when you need verbatim text (code, API signatures, exact numbers) since the subagent paraphrases, or when the page is already small.";
+  " Set `false` when you need verbatim text (code, API signatures, exact numbers) since the subagent paraphrases, or when the page is already small.";
 
 // Build the agent-facing visit_page surface for the current config.
 //
 // A disabled feature is omitted from every string. Interactions: when `clean`
 // is disabled, the "Combine with `clean: true`" sentence is dropped from the
-// summary parameter description; the clean+summary research guideline appears
+// summary parameter description. The clean + summary research guideline appears
 // only when both features are enabled.
 export function visitPageSurface(options: VisitPageOptions): VisitPageSurface {
   const surface: VisitPageSurface = {
@@ -106,6 +107,33 @@ export function visitPageSurface(options: VisitPageOptions): VisitPageSurface {
   }
 
   return surface;
+}
+
+// The `visit_page` parameter schema for the current config.
+//
+// An enabled feature's parameter is required; a disabled one is removed from
+// both `properties` and `required`, so the schema stays valid and never asks
+// for a hidden feature. The static type keeps both parameters: a disabled
+// feature's key is absent at run time, so index.ts reads them only behind their
+// config flag (`stripDisabledArguments` drops stale arguments before
+// validation).
+export function visitPageParameters(options: VisitPageOptions) {
+  const surface = visitPageSurface(options);
+  const parameters = Type.Object({
+    url: Type.String({ description: "Full URL to visit" }),
+    clean: Type.Boolean({ description: surface.cleanParamDescription ?? "" }),
+    summary: Type.Boolean({ description: surface.summaryParamDescription ?? "" }),
+  });
+
+  const shape = parameters as unknown as { properties?: Record<string, unknown>; required?: string[] };
+  const drop = (key: "clean" | "summary") => {
+    if (shape.properties) delete shape.properties[key];
+    if (shape.required) shape.required = shape.required.filter((name) => name !== key);
+  };
+  if (!options.cleanEnabled) drop("clean");
+  if (!options.summaryEnabled) drop("summary");
+
+  return parameters;
 }
 
 // Drop arguments for disabled features before schema validation.

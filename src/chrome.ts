@@ -936,7 +936,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // Fallback: if the primary extractor returned an error marker or nothing
   // useful, run the fallback JS in the same tab (no re-navigation).
   if (opts.fallbackJs && (result.startsWith("__DEFUDDLE_ERROR__") || result.trim().length < 50)) {
-    onStatus("Clean extraction yielded no content - falling back to generic extractor...");
+    onStatus("Clean extraction failed - falling back to the generic extractor...");
     result = await cdp.evaluate(opts.fallbackJs);
   }
 
@@ -1102,8 +1102,19 @@ export async function visitPage(
   // extraction) for far cleaner Markdown than the block-walker fallback. If
   // Defuddle fails or returns nothing, the fallbackJs runs in the same tab.
   if (clean) {
+    // Defuddle is an npm dependency. If it is missing (dependencies never
+    // installed), degrade to the generic extractor instead of failing the
+    // call: an empty bundle makes the driver return a __DEFUDDLE_ERROR__
+    // marker, which triggers fallbackJs. The real reason is logged for
+    // PI_SEARCH_DEBUG.
+    let bundle = "";
+    try {
+      bundle = getDefuddleBundle();
+    } catch (err) {
+      debugLog(`Defuddle unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return extractVia(url, status, "Using Defuddle for clean article extraction...",
-      getDefuddleBundle() + "\n;" + DEFUDDLE_DRIVER_JS,
+      bundle + "\n;" + DEFUDDLE_DRIVER_JS,
       { clickConsent: true, fallbackJs: EXTRACT_PAGE_JS });
   }
 

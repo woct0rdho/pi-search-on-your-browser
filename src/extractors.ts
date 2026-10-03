@@ -13,8 +13,7 @@
 // it's pure data + pure functions.
 
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 // Google consent + search
 
@@ -96,26 +95,48 @@ export const EXTRACT_PAGE_JS =
   "})()";
 
 // Defuddle (clean article extraction)
-// A vendored, self-contained UMD bundle of Defuddle (MIT, by Steph Ango /
-// @kepano) - the same library the Obsidian Web Clipper uses. When injected
-// into a page, it exposes `window.Defuddle`, which extracts the page's main
-// article content (reader-mode style: drops nav, sidebars, ads, footers) and
-// converts it to clean Markdown via the bundled Turndown engine.
+// Defuddle (MIT, by Steph Ango / @kepano - the library behind the Obsidian
+// Web Clipper) is a regular npm dependency now. Its browser entry
+// (`defuddle/full` -> `dist/index.full.js`) is a self-contained UMD bundle
+// that exposes `window.Defuddle` when injected into a page.
 //
-// This is far cleaner than EXTRACT_PAGE_JS (the naive block-walker fallback)
-// for articles, docs, and blog posts: no navigation noise, no "visible links"
+// The *full* entry is required, not the default one: only it bundles the
+// Turndown-based HTML -> Markdown converter, so `{ markdown: true }` actually
+// produces Markdown (the slim entry silently ignores the option and returns
+// HTML) - plus MathML/Temml rendering for math-heavy pages.
+//
+// It is injected with the driver below in a single Runtime.evaluate call, and
+// is far cleaner than EXTRACT_PAGE_JS (the naive block-walker fallback) for
+// articles, docs, and blog posts: no navigation noise, no "visible links"
 // dump, no 90 KB truncation cliff - just the article content as Markdown.
-//
-// See src/vendor/README.md for build provenance and license attribution.
-const DEFUDDLE_BUNDLE_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "vendor",
-  "defuddle-browser.js",
-);
+
+const requireFromHere = createRequire(import.meta.url);
+
+// Absolute path of the installed Defuddle browser bundle (the package's UMD
+// entry, resolved through its `exports` map). Exported for tests.
+export function defuddleBundlePath(): string {
+  try {
+    return requireFromHere.resolve("defuddle/full");
+  } catch {
+    throw new Error(
+      "The 'defuddle' package is not installed - run `pnpm install` (or `npm install`). " +
+        "Clean extraction needs it; without it, visit_page({ clean: true }) falls back to the generic extractor.",
+    );
+  }
+}
+
 let defuddleBundleCache: string | null = null;
+
+// The UMD bundle text, read once and cached.
 export function getDefuddleBundle(): string {
   if (defuddleBundleCache === null) {
-    defuddleBundleCache = readFileSync(DEFUDDLE_BUNDLE_PATH, "utf8");
+    // Shadow `module`, `exports` and `define` so the UMD always takes its
+    // browser-global branch ("set window.Defuddle") even on a page that
+    // happens to define any of them.
+    defuddleBundleCache =
+      "(function(module, exports, define){" +
+      readFileSync(defuddleBundlePath(), "utf8") +
+      "\n})(undefined, undefined, undefined)";
   }
   return defuddleBundleCache;
 }
@@ -256,8 +277,8 @@ export const X_EXTRACT_JS = `(async () => {
 // The generic extractor misses these (no <p>/<li> structure) and flattens
 // comments into an unattributed wall of text. Reddit lazy-loads comments on
 // scroll, so this is async + self-scrolling and dedupes by `thingid`, like the
-// X extractor. Only post/comment pages (path has /comments/) are routed here;
-// subreddit listings and user pages use the generic extractor.
+// X extractor. Only post/comment pages (path has /comments/) are routed here.
+// Subreddit listings and user pages use the generic extractor.
 export const REDDIT_EXTRACT_JS = `(async () => {
   const clean = s => (s||"").replace(/\\s+/g, " ").trim();
   const cleanMulti = s => (s||"").replace(/[ \\t]+/g, " ").replace(/\\n{3,}/g, "\\n\\n").trim();
@@ -553,7 +574,7 @@ export const SCHOLAR_EXTRACT_JS = `(() => {
 // URL classifiers
 // Used by visitPage() to route URLs to the right specialized extractor.
 // Specialized extractors produce far cleaner, more structured markdown than
-// the generic block-walker; the classifiers ensure each is only used on the
+// the generic block-walker. The classifiers ensure each is only used on the
 // URL shape it was designed for.
 
 export function isXUrl(url: string): boolean {

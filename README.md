@@ -45,24 +45,25 @@ agent can still `visit_page` it.
 
 ### `visit_page`
 
-Visit any URL and get the page content as markdown. Two optional parameters keep large pages from filling your conversation:
+Visit any URL and get the page content as markdown. Two parameters keep large pages from filling your conversation:
 
 - `summary` - delegate to a subagent model that returns only a concise summary of the whole page (the raw page never enters your context; reuses your current model by default). [See below.](#optional-summary--keep-your-chat-context-small)
 - `clean` - extract with Defuddle reader-mode (drops nav/sidebars/ads; ~47% fewer tokens). [See below.](#optional-clean--clean-article-markdown-via-defuddle)
 
-`summary` and `clean` are each offered only while their mode is enabled (both
-are on by default). Disable either with `"summaryEnabled": false` /
-`"cleanEnabled": false` in the config file, `PI_BROWSE_SUMMARY_ENABLED=0` /
-`PI_BROWSE_CLEAN_ENABLED=0`, or `/browse off` / `/browse clean off`: that flag's
-parameter is removed from the tool schema and every mention of it disappears from
+`summary` and `clean` are required on every call while their mode is enabled
+(both are on by default), so the schema asks for `true` or `false` explicitly.
+Disable a mode with `"summaryEnabled": false` / `"cleanEnabled": false` in the
+config file, `PI_BROWSE_SUMMARY_ENABLED=0` / `PI_BROWSE_CLEAN_ENABLED=0`, or
+`/browse off` / `/browse clean off`: its parameter is then removed from the tool
+schema (including the `required` list) and every mention of it disappears from
 the description, prompt snippet, and guidelines - the model is not told the
 option exists. Disabling one feature never affects the other, `url`, or
 `google_search`.
 
 ```
-visit_page({ url: "https://example.com/article" })
-visit_page({ url: "https://react.dev/reference/react/useState", summary: true })
-visit_page({ url: "https://react.dev/reference/react/useState", clean: true })
+visit_page({ url: "https://example.com/article", clean: false, summary: false })
+visit_page({ url: "https://react.dev/reference/react/useState", clean: false, summary: true })
+visit_page({ url: "https://react.dev/reference/react/useState", clean: true, summary: false })
 ```
 
 X (Twitter) support: Any `x.com` / `twitter.com` URL - a search results
@@ -72,9 +73,9 @@ dedicated Chrome profile carries your X login. X virtualizes its timeline, so
 the extractor scrolls and collects tweets incrementally, deduping by permalink.
 
 ```
-visit_page({ url: "https://x.com/search?q=0x%20alpha&f=top" })   // top results
-visit_page({ url: "https://x.com/search?q=0x%20alpha&f=live" })  // latest
-visit_page({ url: "https://x.com/xezpeleta" })                   // a profile's tweets
+visit_page({ url: "https://x.com/search?q=0x%20alpha&f=top", clean: false, summary: false })   // top results
+visit_page({ url: "https://x.com/search?q=0x%20alpha&f=live", clean: false, summary: false })  // latest
+visit_page({ url: "https://x.com/xezpeleta", clean: false, summary: false })                   // a profile's tweets
 ```
 
 Reddit support: Any `reddit.com` post URL (a path containing `/comments/`)
@@ -85,7 +86,7 @@ incrementally, deduping by comment id. Subreddit listings and user pages fall
 through to the generic extractor.
 
 ```
-visit_page({ url: "https://www.reddit.com/r/programming/comments/.../" })
+visit_page({ url: "https://www.reddit.com/r/programming/comments/.../", clean: false, summary: false })
 ```
 
 Amazon support: Any `amazon.*` product page (`/dp/ASIN`, `/gp/product/ASIN`)
@@ -97,8 +98,8 @@ extractor would pull. Search pages return a clean listing of products with
 title, price, rating, ASIN, and link, scrolling to collect more results.
 
 ```
-visit_page({ url: "https://www.amazon.es/s?k=E220-900T22D" })        // search
-visit_page({ url: "https://www.amazon.es/-/en/.../dp/B097GZBZ9Y" })  // product
+visit_page({ url: "https://www.amazon.es/s?k=E220-900T22D", clean: false, summary: false })        // search
+visit_page({ url: "https://www.amazon.es/-/en/.../dp/B097GZBZ9Y", clean: false, summary: false })  // product
 ```
 
 Other Amazon pages (category, seller, etc.) fall through to the generic
@@ -114,7 +115,7 @@ Citation counts are parsed locale-agnostically ("Cited by 1108" / "Cité 1108
 fois" / "Citado por 1108" / "Zitiert von 1108").
 
 ```
-visit_page({ url: "https://scholar.google.com/scholar?q=transformer+attention+is+all+you+need" })
+visit_page({ url: "https://scholar.google.com/scholar?q=transformer+attention+is+all+you+need", clean: false, summary: false })
 ```
 
 ### Optional `summary` - keep your chat context small
@@ -126,11 +127,11 @@ configurable subagent model (a separate, cheap LLM call) that returns only
 a concise summary of *all* the information on the page. The raw page markdown
 never enters your chat context - only the subagent's summary does.
 
+While summary mode is enabled, `summary` is required on every call: pass
+`false` to get the page markdown instead.
+
 ```
-visit_page({
-  url: "https://react.dev/reference/react/useState",
-  summary: true,
-})
+visit_page({ url: "https://react.dev/reference/react/useState", clean: false, summary: true })
 ```
 
 - `summary` summarizes the page - it reads the single page at the `url`
@@ -182,11 +183,11 @@ page is instead extracted with [Defuddle](https://github.com/kepano/defuddle)
 uses): a reader-mode-style article extractor that drops navigation, sidebars,
 ads, and footers, returning only the main article content as clean Markdown.
 
+While clean mode is enabled, `clean` is required on every call: pass `false`
+for the default page extraction.
+
 ```
-visit_page({
-  url: "https://react.dev/reference/react/useState",
-  clean: true,
-})
+visit_page({ url: "https://react.dev/reference/react/useState", clean: true, summary: false })
 ```
 
 - Best for articles, docs, and blog posts - cleaner output and far fewer
@@ -199,17 +200,16 @@ visit_page({
   clean article text to read, and `summary` returns only its concise digest -
   ideal for large articles.
 
-The Defuddle bundle (~500 KB, MIT-licensed, with Turndown bundled in) is
-vendored at `src/vendor/defuddle-browser.js` and injected into the page via a
-single CDP `Runtime.evaluate` call before the extraction driver runs. See
-[`src/vendor/README.md`](src/vendor/README.md) for build provenance.
+Defuddle is a regular npm dependency (`defuddle`, MIT-licensed). Its full
+browser entry (`dist/index.full.js`, ~750 KB, UMD) is injected into the page
+via a single CDP `Runtime.evaluate` call before the extraction driver runs -
+the full entry is what bundles Defuddle's Turndown-based Markdown converter
+(and its math rendering), which is why `clean: true` returns Markdown rather
+than HTML. Missing the dependency degrades gracefully - `clean: true` falls back to the
+generic extractor.
 
 ```
-visit_page({
-  url: "https://react.dev/reference/react/useState",
-  clean: true,
-  summary: true,
-})
+visit_page({ url: "https://react.dev/reference/react/useState", clean: true, summary: true })
 ```
 
 ### HTTP error detection (4xx / 5xx)
@@ -427,11 +427,11 @@ pnpm install
 pnpm test
 ```
 
-Six layers of tests (120 total):
+Six layers of tests (123 total):
 
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the vendored Defuddle bundle (non-empty, UMD, no Node-only deps, cached), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
+- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
 - `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
 - `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled; no site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere; and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.

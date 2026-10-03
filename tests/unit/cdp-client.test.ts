@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { runInPageSession, CHROME_LAUNCH_ARGS, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
-import { DEFUDDLE_DRIVER_JS, getDefuddleBundle } from "../../src/extractors.ts";
+import { DEFUDDLE_DRIVER_JS, getDefuddleBundle, defuddleBundlePath } from "../../src/extractors.ts";
 
 // Fake CDP
 // Implements CDPLike so runInPageSession can be exercised without a real
@@ -39,7 +39,7 @@ class FakeCDP implements CDPLike {
   docResponseStatus = 0;
   docResponseStatusText = "";
   // Document responses emitted for Page.navigate, in order. Use for
-  // interstitials (403 then 200) and iframe filtering; `delayMs` simulates a
+  // interstitials (403 then 200) and iframe filtering. `delayMs` simulates a
   // response that arrives after the challenge solved itself.
   docSequence: FakeDocResponse[] = [];
   // Document responses emitted for Page.reload (same shape as docSequence).
@@ -236,7 +236,7 @@ test("navigation enables Page + Network (never Runtime) and then navigates", asy
     methods.slice(0, 3),
     ["Page.enable", "Network.enable", "Page.navigate"],
   );
-  // Runtime.enable is a known CDP fingerprint used by anti-bot scripts;
+  // Runtime.enable is a known CDP fingerprint used by anti-bot scripts.
   // Runtime.evaluate works without it, so it must never be enabled.
   assert.ok(!methods.includes("Runtime.enable"), "Runtime.enable must not be called");
   const nav = fake.calls.find((c) => c.method === "Page.navigate");
@@ -269,12 +269,12 @@ test("dynamicScroll issues scroll evaluations", async () => {
 });
 
 // bringToFront (background-tab scrolling fix)
-// Tool tabs open in the background; Chrome suspends the renderer of
+// Tool tabs open in the background. Chrome suspends the renderer of
 // non-active tabs, so scrolling (dynamicScroll + the self-scrolling inside
 // the async extractors) can't trigger lazy-loaded content. The fix: call CDP
 // Page.bringToFront so the tab becomes active and the renderer resumes.
 
-// Calls are recorded in order; helper to find a method's index.
+// Calls are recorded in order. Helper to find a method's index.
 function callIndex(fake: FakeCDP, method: string): number {
   return fake.calls.findIndex((c) => c.method === method);
 }
@@ -338,7 +338,7 @@ test("bringToFront is NOT called on HTTP error (don't steal focus for dead pages
 });
 
 test("bringToFront failure is non-fatal (extraction still runs)", async () => {
-  // Some targets may reject Page.bringToFront; the catch must let extraction
+  // Some targets may reject Page.bringToFront. The catch must let extraction
   // proceed (the launch flags still help in that case).
   const fake = new FakeCDP();
   let threw = false;
@@ -438,15 +438,43 @@ test("DEFUDDLE_DRIVER_JS parses as valid JavaScript", () => {
   assert.doesNotThrow(() => new Function(DEFUDDLE_DRIVER_JS), "driver should parse");
 });
 
-test("getDefuddleBundle returns a non-empty UMD bundle exposing window.Defuddle", () => {
+test("getDefuddleBundle returns the installed Defuddle UMD bundle", () => {
   const bundle = getDefuddleBundle();
-  assert.ok(bundle.length > 100_000, `bundle should be large (~500KB), got ${bundle.length}`);
-  // UMD header: assigns to the global `Defuddle`.
-  assert.ok(bundle.includes("var Defuddle="), "bundle should expose a Defuddle global");
-  // No Node-only dependencies should be referenced.
+  assert.ok(bundle.length > 100_000, `bundle should be large, got ${bundle.length}`);
+  // The npm browser entry is a UMD bundle that falls back to a `Defuddle`
+  // global when injected into a page.
+  assert.ok(bundle.includes("Defuddle"), "bundle should expose the Defuddle API");
+  assert.ok(bundle.includes("typeof define"), "bundle should be the UMD build");
+  // Must be the *full* entry: only it bundles the Markdown converter, so
+  // `{ markdown: true }` in the driver actually returns Markdown. The slim
+  // entry silently ignores the option and returns HTML.
+  assert.ok(bundle.includes("createMarkdownContent"), "bundle should include the Markdown converter");
+  // The browser entry must not pull in the Node-only DOM polyfill.
   assert.ok(!bundle.includes("linkedom"), "bundle should not reference linkedom");
-  assert.ok(!bundle.includes("temml"), "bundle should not reference temml");
-  assert.ok(!bundle.includes("mathml-to-latex"), "bundle should not reference mathml-to-latex");
+});
+
+test("the Defuddle bundle is the installed npm package (not a vendored copy)", () => {
+  const bundlePath = defuddleBundlePath();
+  assert.ok(bundlePath.includes("defuddle"), `should resolve the defuddle package: ${bundlePath}`);
+  assert.ok(
+    !bundlePath.replace(/\\/g, "/").includes("src/vendor"),
+    `must not resolve a vendored copy: ${bundlePath}`,
+  );
+
+  // The injected code must be (a wrapped copy of) that exact file, so bumping
+  // the dependency is all it takes to update the extractor.
+  const fileText = readFileSync(bundlePath, "utf8");
+  assert.ok(
+    getDefuddleBundle().includes(fileText.slice(0, 200)),
+    "the injected bundle should contain the package's UMD file",
+  );
+
+  // ...and the dependency must stay declared, or `pnpm install` stops
+  // providing it.
+  const rootPkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as {
+    dependencies?: Record<string, string>;
+  };
+  assert.ok(rootPkg.dependencies?.defuddle, "defuddle must be a declared dependency");
 });
 
 test("getDefuddleBundle is cached (same reference on second call)", () => {
@@ -505,7 +533,7 @@ test("HTTP error does NOT trigger fallbackJs (the page is genuinely gone)", asyn
     fallbackJs: "genericExtractor()",
   }));
 
-  // The HTTP error marker passes through; the fallback extractor is NOT run.
+  // The HTTP error marker passes through. The fallback extractor is NOT run.
   assert.ok(result.startsWith("__HTTP_ERROR__: 404"), "should return HTTP error, not fallback content");
   assert.ok(!fake.evaluations.includes("genericExtractor()"), "fallback must not run on HTTP error");
   assert.ok(!fake.evaluations.includes("defuddleDriver()"), "primary must not run on HTTP error");
@@ -548,7 +576,7 @@ test("no Network.responseReceived (status 0) proceeds normally", async () => {
 });
 
 test("an iframe Document 403 does not override the main document's 200", async () => {
-  // Ad/user-sync iframes also emit Document responses; the status filter must
+  // Ad/user-sync iframes also emit Document responses. The status filter must
   // follow the main frame, not "any Document response".
   const fake = new FakeCDP();
   fake.docSequence = [
@@ -661,7 +689,7 @@ test("a 404 is final immediately (no reload, no wasted evaluations)", async () =
 // Pi's TUI runs in raw mode and renders raw stderr writes on the text input
 // bar, so an unconditional console.error shows up as "[pi-search] ..." while
 // the user is typing. All diagnostics live behind PI_SEARCH_DEBUG (via the
-// debugLog helper); user-visible progress goes through the tool's onStatus
+// debugLog helper). User-visible progress goes through the tool's onStatus
 // callback instead.
 
 test("chrome.ts writes to stderr only behind PI_SEARCH_DEBUG", () => {
@@ -688,7 +716,7 @@ test("chrome.ts writes to stderr only behind PI_SEARCH_DEBUG", () => {
 });
 
 // Navigation resilience (parallel tool calls / slow browsers)
-// Real-world failure: the agent issued two visit_page calls in parallel; under
+// Real-world failure: the agent issued two visit_page calls in parallel. Under
 // a slow proxy the pages took >30s, and the fixed per-call CDP timeout killed
 // one of them with "visit_page failed: CDP call timeout: Page.navigate".
 // Page.navigate is now retried, accepted as soon as the page loads, and a dead

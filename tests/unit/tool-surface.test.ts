@@ -2,15 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   visitPageSurface,
+  visitPageParameters,
   stripDisabledArguments,
   type VisitPageOptions,
 } from "../../src/tool-surface.ts";
 
-// visitPageSurface() builds the agent-facing text of visit_page from the two
-// config flags. The core invariant: a disabled feature must be invisible to
-// the model - no parameter, no description/guideline mention, no /browse hint
-// - while the rest of the surface stays identical. index.ts drops the matching
-// parameter from the schema; stripDisabledArguments covers stale arguments.
+// visitPageSurface() + visitPageParameters() build the agent-facing surface of
+// visit_page from the two config flags. The core invariant: a disabled feature
+// must be invisible to the model - no parameter, no description/guideline
+// mention, no /browse hint - while the rest of the surface stays identical.
+// stripDisabledArguments covers stale arguments.
 
 const COMBOS: VisitPageOptions[] = [
   { summaryEnabled: true, cleanEnabled: true },
@@ -91,6 +92,35 @@ test("optional parameter descriptions exist only when enabled", () => {
       `[${label(options)}] clean param description`,
     );
   }
+});
+
+// An enabled feature's parameter is required; a disabled one is removed from
+// the schema's `properties` and `required` alike.
+
+test("clean/summary are required iff enabled", () => {
+  for (const options of COMBOS) {
+    const schema = visitPageParameters(options) as {
+      properties?: Record<string, unknown>;
+      required?: string[];
+    };
+    const required = schema.required ?? [];
+    const properties = Object.keys(schema.properties ?? {});
+
+    assert.deepEqual(required.includes("url"), true, `[${label(options)}] url is always required`);
+    assert.equal(required.includes("clean"), options.cleanEnabled, `[${label(options)}] clean required`);
+    assert.equal(required.includes("summary"), options.summaryEnabled, `[${label(options)}] summary required`);
+    assert.equal(properties.includes("clean"), options.cleanEnabled, `[${label(options)}] clean property`);
+    assert.equal(properties.includes("summary"), options.summaryEnabled, `[${label(options)}] summary property`);
+  }
+});
+
+test("a disabled feature leaves no dangling required entry", () => {
+  const none = visitPageParameters({ summaryEnabled: false, cleanEnabled: false }) as {
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+  assert.deepEqual(none.required, ["url"]);
+  assert.deepEqual(Object.keys(none.properties ?? {}), ["url"]);
 });
 
 test("the surface is the same base regardless of which optional features are on", () => {

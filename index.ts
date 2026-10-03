@@ -65,6 +65,7 @@ import {
 } from "./src/subagent.js";
 import {
   visitPageSurface,
+  visitPageParameters,
   stripDisabledArguments,
 } from "./src/tool-surface.js";
 
@@ -124,33 +125,17 @@ function updateStatus(ctx: {
 
 // Build the visit_page tool definition from the current config.
 //
-// The `summaryEnabled` and `cleanEnabled` flags each gate one optional feature.
-// A disabled feature is hidden from the model completely: its parameter is
-// omitted from the schema and the description, prompt snippet, and guidelines
-// are built without any mention of it. Registered by syncVisitPageTool() in
-// the factory and re-registered on /browse on|off and /browse clean on|off, so
-// a config change applies to the next turn.
+// The `summaryEnabled` and `cleanEnabled` flags each gate one feature: while
+// enabled its parameter is required, and when disabled it is hidden from the
+// model completely - omitted from the schema and never mentioned in the
+// description, prompt snippet, or guidelines. Registered by syncVisitPageTool()
+// in the factory and re-registered on /browse on|off and /browse clean on|off,
+// so a config change applies to the next turn.
 function visitPageToolDefinition() {
   const summaryEnabled = config.summaryEnabled;
   const cleanEnabled = config.cleanEnabled;
   const surface = visitPageSurface({ summaryEnabled, cleanEnabled });
-
-  // Build the full schema first so TypeBox infers clean/summary as optional
-  // booleans (a conditional spread degrades their Static type to `unknown`),
-  // then drop the disabled feature's property: a hidden feature must not
-  // appear in the schema the model sees.
-  const parameters = Type.Object({
-    url: Type.String({ description: "Full URL to visit" }),
-    clean: Type.Optional(Type.Boolean({ description: surface.cleanParamDescription })),
-    summary: Type.Optional(Type.Boolean({ description: surface.summaryParamDescription })),
-  });
-  if (!cleanEnabled || !summaryEnabled) {
-    const properties = (parameters as { properties?: Record<string, unknown> }).properties;
-    if (properties) {
-      if (!cleanEnabled) delete properties.clean;
-      if (!summaryEnabled) delete properties.summary;
-    }
-  }
+  const parameters = visitPageParameters({ summaryEnabled, cleanEnabled });
 
   return defineTool<typeof parameters, VisitPageDetails>({
     name: "visit_page",
@@ -162,7 +147,15 @@ function visitPageToolDefinition() {
     prepareArguments:
       summaryEnabled && cleanEnabled
         ? undefined
-        : (args: unknown) => stripDisabledArguments(args, { summaryEnabled, cleanEnabled }),
+        : (args: unknown) =>
+            // A disabled feature was dropped from the schema, so the stripped
+            // result can omit a property TypeBox's static type still lists. The
+            // cast only bridges that (validation uses the built schema).
+            stripDisabledArguments(args, { summaryEnabled, cleanEnabled }) as {
+              url: string;
+              clean: boolean;
+              summary: boolean;
+            },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const { url, clean } = params;
       if (!url || !url.trim()) {
@@ -303,7 +296,7 @@ function visitPageToolDefinition() {
       }
 
       // Summary mode -> delegate to the subagent
-      // Only the subagent's summary enters the chat context; the full page
+      // Only the subagent's summary enters the chat context. The full page
       // markdown is consumed by the subagent and discarded.
       // subModel is guaranteed set here (summary mode passed the precheck above).
       const model = subModel!;
@@ -889,7 +882,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
   // visit_page tool
   // visit_page is (re)registered from the current config by syncVisitPageTool().
   // The flags (`summaryEnabled`, `cleanEnabled`) hide their option and every
-  // mention of it from the model; pi replaces a same-named tool and refreshes
+  // mention of it from the model. Pi replaces a same-named tool and refreshes
   // the registry in the same session, so /browse on|off and /browse clean
   // on|off take effect on the next turn.
   const syncVisitPageTool = () => pi.registerTool(visitPageToolDefinition());
