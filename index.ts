@@ -9,6 +9,10 @@
 //
 // Registered tools:
 //   - google_search   - Search Google in a visible Chrome browser, returns markdown links + snippet
+//   - google_image_search - Search Google Images. Every result is the image URL plus the
+//                       URL of the page the image was found on (plus title and size). The
+//                       original image URL is resolved through Google's preview panel. Hosts
+//                       that block hotlinking fall back to Google's cached thumbnail.
 //   - visit_page      - Visit a URL in a visible Chrome browser, returns rendered page as markdown.
 //                       X (Twitter) URLs get a dedicated tweet extractor (search/profile/tweet).
 //                       Reddit post URLs get a dedicated comment extractor (post + threaded comments).
@@ -49,7 +53,7 @@ import {
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { googleSearch, visitPage, shutdownChrome, type SearchResult } from "./src/chrome.js";
+import { googleSearch, googleImageSearch, visitPage, shutdownChrome, type SearchResult } from "./src/chrome.js";
 import {
   config,
   reloadConfig,
@@ -92,6 +96,10 @@ interface GoogleSearchDetails {
   chars?: number;
   // Marks an onUpdate progress payload (never persisted).
   _progress?: boolean;
+}
+
+interface GoogleImageSearchDetails extends GoogleSearchDetails {
+  count?: number;
 }
 
 // First text block of a tool result, or "" when there is none.
@@ -861,6 +869,101 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       renderResult(result, { expanded, isPartial }, theme) {
         if (isPartial) {
           const progress = resultText(result) || "Searching...";
+          return new Text(theme.fg("warning", progress), 0, 0);
+        }
+
+        const details = result.details;
+        if (!expanded) {
+          const parts: string[] = [];
+          if (details?.chars) parts.push(`${details.chars.toLocaleString()} chars`);
+          if (details?.elapsed) parts.push(details.elapsed);
+          if (details?.url) parts.push(new URL(details.url).hostname);
+          return new Text(theme.fg("muted", ` -> ${parts.join(" - ")}`), 0, 0);
+        }
+
+        const text = resultText(result);
+        return new Text(`\n${text.split("\n").map((l) => theme.fg("toolOutput", l)).join("\n")}`, 0, 0);
+      },
+    }),
+  );
+
+  // google_image_search tool
+
+  const googleImageSearchParams = Type.Object({
+    query: Type.String({ description: "Image search query to send to Google Images" }),
+    count: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: 12,
+        description:
+          "How many image results to return (1-12, default 8). Each result is opened in Google's preview panel to resolve the original image URL, so higher counts take longer.",
+      }),
+    ),
+  });
+
+  pi.registerTool(
+    defineTool<typeof googleImageSearchParams, GoogleImageSearchDetails>({
+      name: "google_image_search",
+      label: "Google Image Search",
+      description:
+        "Search Google Images in your visible Chrome browser. Every result gives the image URL and the URL of the page the image was found on, plus the page title and, when known, the image size. The original image URL is resolved through Google's preview panel; when a site blocks hotlinking, Google's cached thumbnail is returned instead (marked google-cached). Uses your real browser fingerprint - no API keys, no headless detection.",
+      promptSnippet:
+        "google_image_search: search Google Images in your visible browser; returns each image URL with the page URL it came from",
+      promptGuidelines: [
+        "Use google_image_search when you need pictures, diagrams, charts, or screenshots and want to know where they come from. Each result carries the image URL (original when the site allows hotlinking, otherwise Google's cached thumbnail, marked google-cached) and the page URL the image appears on - visit_page that page when you need the context around the image.",
+      ],
+      parameters: googleImageSearchParams,
+      async execute(_toolCallId, params, _signal, onUpdate) {
+        const { query, count } = params;
+        if (!query || !query.trim()) {
+          return {
+            content: [{ type: "text" as const, text: "Tool error: google_image_search requires a query." }],
+            details: {},
+          };
+        }
+
+        try {
+          const started = Date.now();
+          const result = await googleImageSearch(query.trim(), {
+            count,
+            onStatus: (msg) => {
+              onUpdate?.({
+                content: [{ type: "text", text: msg }],
+                details: { _progress: true },
+              });
+            },
+          });
+          const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+          return {
+            content: [{ type: "text" as const, text: result.markdown }],
+            details: {
+              url: result.url,
+              elapsed: `${elapsed}s`,
+              chars: result.markdown.length,
+              count,
+            },
+          };
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`google_image_search failed: ${message}`);
+        }
+      },
+
+      renderCall(args, theme) {
+        const q = (args.query || "").slice(0, 60);
+        const trunc = q.length < (args.query || "").length ? "..." : "";
+        const count = args.count ? theme.fg("dim", ` x${args.count}`) : "";
+        return new Text(
+          `${theme.fg("toolTitle", theme.bold("google_image_search"))} "${theme.fg("accent", q + trunc)}"${count}`,
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, { expanded, isPartial }, theme) {
+        if (isPartial) {
+          const progress = resultText(result) || "Searching images...";
           return new Text(theme.fg("warning", progress), 0, 0);
         }
 

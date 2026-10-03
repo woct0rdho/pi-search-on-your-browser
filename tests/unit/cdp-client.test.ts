@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { runInPageSession, CHROME_LAUNCH_ARGS, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
+import { runInPageSession, CHROME_LAUNCH_ARGS, googleSearchUrl, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle, defuddleBundlePath } from "../../src/extractors.ts";
 
 // Fake CDP
@@ -890,6 +890,32 @@ test("findChrome never returns an empty path", () => {
   } finally {
     process.env = saved;
   }
+});
+
+// Google search URLs must request SafeSearch off explicitly: the tool is meant
+// to return what Google returns, and the parameter overrides a Filter/Blur
+// choice saved in the profile (it is ignored only when SafeSearch is locked by
+// parental controls or an enforcing network).
+
+test("googleSearchUrl asks for SafeSearch off", () => {
+  const url = new URL(googleSearchUrl("red panda"));
+  assert.equal(url.origin + url.pathname, "https://www.google.com/search");
+  assert.equal(url.searchParams.get("q"), "red panda");
+  assert.equal(url.searchParams.get("safe"), "off");
+  assert.equal(url.searchParams.has("udm"), false, "web search must not force an images tab");
+});
+
+test("googleSearchUrl(image) adds udm=2 and keeps safe=off", () => {
+  const url = new URL(googleSearchUrl("red panda", { images: true }));
+  assert.equal(url.searchParams.get("q"), "red panda");
+  assert.equal(url.searchParams.get("safe"), "off");
+  assert.equal(url.searchParams.get("udm"), "2");
+});
+
+test("googleSearchUrl encodes queries without breaking the parameters", () => {
+  const url = new URL(googleSearchUrl('a&b=c "quoted" #hash'));
+  assert.equal(url.searchParams.get("q"), 'a&b=c "quoted" #hash');
+  assert.equal(url.searchParams.get("safe"), "off");
 });
 
 test("chromeSpawnErrorMessage is actionable (never a bare ENOENT crash)", () => {

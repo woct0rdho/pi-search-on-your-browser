@@ -1,14 +1,15 @@
 # pi-search-on-your-browser
 
-Search Google and browse the web in your own visible Chrome browser - no API keys, no headless detection, your real cookies and login sessions. A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that gives your coding agent two tools: `google_search` and `visit_page`.
+Search Google and browse the web in your own visible Chrome browser - no API keys, no headless detection, your real cookies and login sessions. A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that gives your coding agent three tools: `google_search`, `google_image_search`, and `visit_page`.
 
 ## Highlights
 
 - Google search via your real browser - returns compact markdown links + snippets
+- Google image search - every result comes with the image URL and the URL of the page it appears on, plus title and size. The original file is resolved through Google's preview panel when the site allows it
 - `visit_page` fetches any URL as markdown using your visible Chrome (authenticated everywhere - paywalled sites, X, Reddit, Amazon, GitHub)
-- `clean` extraction - reader-mode markdown via [Defuddle](https://github.com/kepano/defuddle) (the Obsidian Web Clipper library); drops nav/sidebars/ads, ~47% fewer tokens on docs pages
-- `summary` subagent - pass `summary: true`, get only a concise summary of the whole page back (the full page never enters your chat context); reuses your current Pi model by default, no setup needed
-- HTTP error detection - dead links return a clear `isError` with status-specific hints instead of error-page gibberish; bot-check 403s are waited out like a real browser
+- `clean` extraction - reader-mode markdown via [Defuddle](https://github.com/kepano/defuddle) (the Obsidian Web Clipper library). Drops nav/sidebars/ads, ~47% fewer tokens on docs pages
+- `summary` subagent - pass `summary: true`, get only a concise summary of the whole page back (the full page never enters your chat context). Reuses your current Pi model by default, no setup needed
+- HTTP error detection - dead links return a clear `isError` with status-specific hints instead of error-page gibberish. Bot-check 403s are waited out like a real browser
 - Site-specific extractors - X/Twitter (structured tweets), Reddit (posts + threaded comments), Amazon (products + search), Google Scholar (papers)
 
 > "If you need AI to do a search for you in the real world, ds4-agent is basically SOTA, because it can access the web sites without any limitations given that it uses your local Chrome browser (no, not in headless mode, that's the trick...)"
@@ -18,12 +19,11 @@ Inspired by the [ds4-agent](https://github.com/antirez/ds4) approach by @antirez
 
 ## How it works
 
-When you call `google_search` or `visit_page`:
-
-1. A visible Chrome window opens (not headless) with a dedicated profile at `~/.pi-search-browser/`
-2. Chrome DevTools Protocol (CDP) is used to navigate and extract content
-3. JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar; [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`; generic block-walker as fallback
-4. Chrome stays alive between calls for speed (kill with `/google-search-kill`)
+When you call `google_search`, `google_image_search`, or `visit_page`:
+- A visible Chrome window opens (not headless) with a dedicated profile at `~/.pi-search-browser/`
+- Chrome DevTools Protocol (CDP) is used to navigate and extract content
+- JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar. [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`. Generic block-walker as fallback
+- Chrome stays alive between calls for speed (kill with `/google-search-kill`)
 
 ## Tools
 
@@ -43,12 +43,52 @@ Chrome tab* (same cookies and proxy as the search), via the CDP network events.
 A wrapper that cannot be resolved is returned as-is rather than dropped, so the
 agent can still `visit_page` it.
 
+### `google_image_search`
+
+Search Google Images (`udm=2`) and get, for every result, both the image URL
+and the URL of the page the image was found on:
+
+```
+google_image_search({ query: "red panda" })
+google_image_search({ query: "red panda", count: 12 })
+```
+
+Each result carries the page title, the image URL, the source page URL and (when
+known) the image size:
+
+```
+1. Red panda - Wikipedia
+   image: https://thumb.wikimedia.org/wikipedia/commons/thumb/f/fd/Red_Panda...1280px-....jpg
+   page: https://en.wikipedia.org/wiki/Red_panda
+   size: 1280x853
+2. Red Panda | National Geographic Kids
+   image: https://i.natgeofe.com/k/63b1a8a7-.../red-panda-full-body_16x9.jpg
+   page: https://kids.nationalgeographic.com/animals/mammals/facts/red-panda
+   size: 1200x675
+```
+
+- The image URL is the original file when the site allows hotlinking. Some
+  hosts don't (Facebook, for one), and Google only keeps a cached copy. Those
+  results are returned with Google's cached thumbnail and are marked
+  `(google-cached)`, so the agent knows the difference. Either way the page URL
+  is the real source page.
+- Google's grid does not contain the original URLs at all - they only show up in
+  the preview panel after a tile is clicked. The extractor therefore opens the
+  first `count` tiles in that panel in the same tab (the page itself is never
+  left) and reads the original URL when it loads. That makes the call take a few
+  seconds longer than `google_search`. Results it doesn't get to in time still
+  come back from the grid data, with the cached thumbnail.
+- `count` is 1-12 (default 8). Fewer results means more time per image, so the
+  top results are more likely to come back at full resolution.
+- Like the other tools it uses your visible Chrome, so it sees the same Google
+  session (consent, language, region, proxy) as `google_search`.
+
 ### `visit_page`
 
 Visit any URL and get the page content as markdown. Two parameters keep large pages from filling your conversation:
 
-- `summary` - delegate to a subagent model that returns only a concise summary of the whole page (the raw page never enters your context; reuses your current model by default). [See below.](#optional-summary--keep-your-chat-context-small)
-- `clean` - extract with Defuddle reader-mode (drops nav/sidebars/ads; ~47% fewer tokens). [See below.](#optional-clean--clean-article-markdown-via-defuddle)
+- `summary` - delegate to a subagent model that returns only a concise summary of the whole page (the raw page never enters your context, reuses your current model by default). [See below.](#optional-summary--keep-your-chat-context-small)
+- `clean` - extract with Defuddle reader-mode (drops nav/sidebars/ads, ~47% fewer tokens). [See below.](#optional-clean--clean-article-markdown-via-defuddle)
 
 `summary` and `clean` are required on every call while their mode is enabled
 (both are on by default), so the schema asks for `true` or `false` explicitly.
@@ -109,8 +149,8 @@ Google Scholar support: Any `scholar.google.com` URL is extracted as
 structured paper results - title, authors/venue/year, citation count, abstract
 snippet, and PDF link - instead of the flat H3 headers the generic extractor
 produces (which drops all the academic metadata). Scholar paginates 10 results
-per page (not infinite scroll), so the extractor returns the current page;
-for more results, visit the next page URL (`&start=10`, `&start=20`, etc.).
+per page (not infinite scroll), so the extractor returns the current page.
+For more results, visit the next page URL (`&start=10`, `&start=20`, etc.).
 Citation counts are parsed locale-agnostically ("Cited by 1108" / "Cité 1108
 fois" / "Citado por 1108" / "Zitiert von 1108").
 
@@ -140,13 +180,13 @@ visit_page({ url: "https://react.dev/reference/react/useState", clean: false, su
   not a replacement for `google_search`. Use `google_search` to find pages,
   then `visit_page` + `summary` to get a compact digest of one of them.
 - The page is fetched exactly as usual (your visible Chrome, all the
-  site-specific extractors above still run); only the *return value* changes.
+  site-specific extractors above still run). Only the *return value* changes.
 - The subagent reuses your current Pi model by default (no API keys to
   set up - Pi's already-configured auth is used). Pin a different model with
   `/browse` if you want a cheaper/faster one for summarization.
 - The footer shows a `🌐 provider/model` indicator only when the subagent is
   pinned to a model different from your session model (run `/browse` with no
-  arguments to see what it resolves to); an animated spinner appears while the
+  arguments to see what it resolves to). An animated spinner appears while the
   subagent is summarizing. Reusing the session model needs no indicator -
   Pi's own footer already shows that model.
 - The collapsed tool result shows the context savings, e.g.
@@ -272,7 +312,7 @@ the next tool call ("Restarting Chrome to apply updated launch flags..."
 appears in the tool call block).
 
 You can still force a restart yourself at any time with `/google-search-kill`
-(or `pkill -f remote-debugging-port=9322`); the next tool call relaunches
+(or `pkill -f remote-debugging-port=9322`). The next tool call relaunches
 Chrome. Symptoms of a stale Chrome: `visit_page` hangs for ~30s on lazy-load
 pages (e.g. `github.com`) and fails with `CDP call timeout: Runtime.evaluate`
 when Chrome's window is in the background.
@@ -293,14 +333,14 @@ Windows PowerShell: `$env:PI_SEARCH_DEBUG="1"; pi`.
 
 ### Parallel tool calls
 
-Agents commonly issue several `google_search` / `visit_page` calls in one
+Agents commonly issue several `google_search` / `google_image_search` / `visit_page` calls in one
 turn. They share the single visible Chrome window, which is intentional - but
 it used to be fragile, and a real session shows why: two parallel GitHub
 visits through a slow proxy took ~32s each, and the fixed 30s per-call CDP
 timeout failed one of them with `visit_page failed: CDP call timeout:
 Page.navigate`. Three things handle that now:
 
-- `Page.navigate` is retried. Each attempt gets 15s; after a timeout the
+- `Page.navigate` is retried. Each attempt gets 15s. After a timeout the
   navigation is re-issued (up to 3 attempts). The command is idempotent for a
   fixed URL, so a retry either picks up the load that already started or
   restarts it. A page that finishes loading while the nav command's reply is
@@ -335,7 +375,7 @@ only if you want to pin a different (e.g. cheaper/faster) model:
 ```
 /browse                          # show current config
 /browse on                       # enable summary mode (default)
-/browse off                      # disable: hide `summary` from the model; raw pages are returned
+/browse off                      # disable: hide `summary` from the model, raw pages are returned
 /browse clean on|off             # enable/disable clean mode (hide `clean` from the model)
 /browse provider openai          # pin a provider (overrides current model)
 /browse model gpt-4o-mini        # pin a model (overrides current model)
@@ -348,7 +388,7 @@ Shorthand: `/browse provider openai` and `/browse model gpt-4o-mini` work
 without the `config` prefix.
 
 When the subagent is pinned to a different model, the footer shows
-`🌐 provider/model`; otherwise no indicator appears, because the session model
+`🌐 provider/model`. Otherwise no indicator appears, because the session model
 it reuses is already in Pi's footer. Run `/browse` with no arguments to see
 the resolved configuration.
 
@@ -366,7 +406,7 @@ restored when you reopen one.
 ```
 
 Environment variables (optional - override the current-model default at
-startup; the config file wins over these once set):
+startup. The config file wins over these once set):
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -380,8 +420,8 @@ startup; the config file wins over these once set):
 
 ### Proxy - browsing through a proxy
 
-On machines that need a proxy to reach the internet, `google_search` and
-`visit_page` would otherwise hang on pages that never load. Chrome is launched
+On machines that need a proxy to reach the internet, `google_search`,
+`google_image_search` and `visit_page` would otherwise hang on pages that never load. Chrome is launched
 with `--proxy-server=<value>`, which covers every request it makes - including
 the CDP-driven navigations - so the whole tool keeps working. You do *not* need
 `HTTP(S)_PROXY` for Pi itself.
@@ -412,7 +452,7 @@ restarted with the new flag (no Pi restart, no manual `/google-search-kill`).
 ## Requirements
 
 - Google Chrome or Chromium installed (Firefox is not currently supported - see below)
-- Node.js 22.19+ (Pi's minimum; tests use native TypeScript stripping)
+- Node.js 22.19+ (Pi's minimum, tests use native TypeScript stripping)
 
 ### Why Chrome only?
 
@@ -427,14 +467,15 @@ pnpm install
 pnpm test
 ```
 
-Six layers of tests (123 total):
+Seven layers of tests (129 total):
 
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy); the test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
+- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
 - `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
-- `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled; no site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere; and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
+- `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.
+- `tests/unit/image-search.test.ts` - covers Google Images: `clampImageCount` (default, floors, clamps, non-numbers) and the generated extractor (`getGoogleImageSearchJs`) - it parses as JavaScript, embeds the clamped count, keeps the DOM contract it depends on (data-lpage tiles, the preview image selector, gstatic detection, the `(google-cached)` marker, and both the image and page URL lines), and bounds its own runtime against the CDP timeout. No browser, no network.
 
 ### Type-checking
 
@@ -442,4 +483,4 @@ Six layers of tests (123 total):
 pnpm run typecheck
 ```
 
-Uses `tsc --strict` and covers `index.ts`, `src/`, and `tests/`. The host-provided packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`) are declared in both `peerDependencies` (what Pi supplies at runtime) and `devDependencies` (so `tsc` resolves them locally). Pi loads extensions through jiti, which strips types without checking them - so the typecheck is the only place stale Pi APIs surface; it is expected to be clean.
+Uses `tsc --strict` and covers `index.ts`, `src/`, and `tests/`. The host-provided packages (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, `typebox`) are declared in both `peerDependencies` (what Pi supplies at runtime) and `devDependencies` (so `tsc` resolves them locally). Pi loads extensions through jiti, which strips types without checking them - so the typecheck is the only place stale Pi APIs surface. It is expected to be clean.

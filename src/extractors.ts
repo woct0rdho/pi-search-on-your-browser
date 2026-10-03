@@ -61,6 +61,135 @@ export const GOOGLE_SEARCH_JS =
   'return lines.join("\\n");' +
   "})()";
 
+// Google Images (`udm=2`). Each result tile carries the source page URL in
+// `data-lpage`, the page title in the thumbnail's `alt`, and a Google-hosted
+// thumbnail in `src`. The original image URL is *not* in the grid: it only
+// appears in the preview panel after a tile is clicked, where Google first
+// shows the cached thumbnail and then swaps in the original (measured: 0.5-4s;
+// on hosts that block hotlinking - e.g. Facebook - it stays cached). So the
+// driver clicks through the tiles and reports the original when it arrives,
+// falling back to the cached thumbnail otherwise. Tiles that don't get their
+// turn before the deadline are reported from the grid data alone, which keeps
+// the whole extractor inside the 30s Runtime.evaluate budget.
+export const GOOGLE_IMAGE_SEARCH_DEFAULT_COUNT = 8;
+export const GOOGLE_IMAGE_SEARCH_MAX_COUNT = 12;
+
+/** Clamp a caller-supplied result count into [1, MAX]; non-numbers use the default. */
+export function clampImageCount(value: unknown): number {
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : Number.NaN;
+  if (!Number.isFinite(n)) return GOOGLE_IMAGE_SEARCH_DEFAULT_COUNT;
+  return Math.min(GOOGLE_IMAGE_SEARCH_MAX_COUNT, Math.max(1, Math.floor(n)));
+}
+
+export function getGoogleImageSearchJs(count: number): string {
+  const max = clampImageCount(count);
+  return `(async () => {
+  const MAX = ${max};
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // The runtime evaluate budget is 30s; return comfortably inside it. Tiles the
+  // deadline cuts off are still reported, from the grid data (cached thumb).
+  const deadline = Date.now() + 20000;
+  const clean = s => (s || "").replace(/\\s+/g, " ").trim();
+  const hostOf = u => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
+  const googleish = u => {
+    const h = hostOf(u);
+    return /(^|\\.)google\\./.test(h) || /(^|\\.)gstatic\\.com$/.test(h) || /(^|\\.)googleusercontent\\.com$/.test(h);
+  };
+  const unwrap = raw => {
+    let href = raw || "";
+    try { href = new URL(href, location.href).href; } catch { return ""; }
+    try {
+      const u = new URL(href);
+      if (/(^|\\.)google\\./.test(u.hostname) && /^\\/(url|imgres)\\/?$/.test(u.pathname)) {
+        const t = u.searchParams.get("q") || u.searchParams.get("url") || u.searchParams.get("imgurl");
+        if (t && /^https?:\\/\\//i.test(t)) return t;
+      }
+    } catch {}
+    return href;
+  };
+
+  // Modern tiles carry the source page in data-lpage; the pre-2023 layout uses
+  // .isv-r with a /url?q= anchor and data-src on the thumbnail.
+  let tiles = [...document.querySelectorAll("[data-lpage]")];
+  if (!tiles.length) tiles = [...document.querySelectorAll(".isv-r")];
+  const items = [];
+  for (const el of tiles) {
+    const img = el.querySelector("img");
+    if (!img) continue;
+    const thumb = img.getAttribute("data-src") || img.getAttribute("src") || "";
+    if (!/^https?:/i.test(thumb)) continue;
+    const a = el.querySelector("a[href]");
+    const page = unwrap(el.getAttribute("data-lpage") || (a ? a.getAttribute("href") : ""));
+    if (!page || googleish(page)) continue;
+    const aria = el.querySelector("a[aria-label]");
+    const title = clean(img.alt || (aria ? aria.getAttribute("aria-label") : ""));
+    items.push({ el: el, img: img, thumb: thumb, page: page, title: title });
+    if (items.length >= MAX) break;
+  }
+
+  // Let the grid finish loading before clicking: the preview originals are
+  // large and would otherwise compete with the thumbnails for bandwidth.
+  for (let i = 0; i < 20 && document.readyState !== "complete"; i++) await sleep(150);
+  await sleep(700);
+
+  // One preview panel serves every tile, sequentially: give each tile a slice
+  // of the time budget - fewer results means more patience per image. Originals
+  // that do load typically appear within ~1s; hosts that block hotlinking never
+  // swap, so waiting longer only costs time.
+  const perItem = Math.max(1200, Math.min(5000, Math.floor(10000 / items.length)));
+
+  const results = [];
+  for (const item of items) {
+    let image = item.thumb, w = 0, h = 0, original = false;
+    if (Date.now() < deadline) {
+      try {
+        item.el.scrollIntoView({ block: "center" });
+        await sleep(200);
+        // The panel may still be showing the previous tile's image; ignore it.
+        const panelBefore = document.querySelector('img[jsname="kn3ccd"], img.sFlh5c');
+        const before = panelBefore ? panelBefore.getAttribute("src") || "" : "";
+        item.img.click();
+        // Google first shows its cached thumbnail, then swaps in the original
+        // when that has loaded (usually <1s; some hosts block hotlinking and
+        // never swap - e.g. Facebook - so the window is bounded).
+        const until = Math.min(deadline, Date.now() + perItem);
+        while (Date.now() < until) {
+          await sleep(150);
+          const big = document.querySelector('img[jsname="kn3ccd"], img.sFlh5c');
+          if (!big) continue;
+          const src = big.getAttribute("src") || "";
+          if (!/^https?:/i.test(src)) continue;
+          if (src === before && !googleish(before)) continue;
+          if (big.naturalWidth) { w = big.naturalWidth; h = big.naturalHeight; }
+          image = src;
+          if (!googleish(src) && (big.naturalWidth || 0) > 60) { original = true; break; }
+        }
+      } catch (e) {}
+    }
+    results.push({ title: item.title, page: item.page, image: image, w: w, h: h, original: original });
+  }
+
+  const lines = ["# Google image search results", "", "URL: " + location.href, ""];
+  results.forEach((r, i) => {
+    lines.push((i + 1) + ". " + (r.title || hostOf(r.page) || "(untitled image)"));
+    lines.push("   image: " + r.image + (r.original ? "" : " (google-cached)"));
+    lines.push("   page: " + r.page);
+    if (r.w && r.h) lines.push("   size: " + r.w + "x" + r.h);
+  });
+  if (!results.length) {
+    lines.push("(no image results found - the page may be showing a consent or captcha screen)");
+    lines.push("");
+    lines.push(clean(document.body.innerText).slice(0, 500));
+  }
+  return lines.join("\\n");
+})()`;
+}
+
 // Generic page extractor (fallback / default)
 
 export const EXTRACT_PAGE_JS =

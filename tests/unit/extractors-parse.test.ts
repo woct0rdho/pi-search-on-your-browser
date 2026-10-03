@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   GOOGLE_CONSENT_JS,
   GOOGLE_SEARCH_JS,
+  getGoogleImageSearchJs,
   EXTRACT_PAGE_JS,
   X_EXTRACT_JS,
   REDDIT_EXTRACT_JS,
@@ -22,6 +23,7 @@ import {
 const extractors: Record<string, string> = {
   GOOGLE_CONSENT_JS,
   GOOGLE_SEARCH_JS,
+  GOOGLE_IMAGE_SEARCH_JS: getGoogleImageSearchJs(8),
   EXTRACT_PAGE_JS,
   X_EXTRACT_JS,
   REDDIT_EXTRACT_JS,

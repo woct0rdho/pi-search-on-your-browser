@@ -19,6 +19,8 @@ import { resolveGoogleRedirectsInBrowser } from "./google-links.ts";
 import {
   GOOGLE_CONSENT_JS,
   GOOGLE_SEARCH_JS,
+  getGoogleImageSearchJs,
+  clampImageCount,
   EXTRACT_PAGE_JS,
   X_EXTRACT_JS,
   REDDIT_EXTRACT_JS,
@@ -40,8 +42,8 @@ const CDP_TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 1_048_576; // 1 MB
 
 // Timeout for the small HTTP calls to Chrome's DevTools endpoint
-// (/json/version, /json/close). They answer instantly while Chrome is alive;
-// without a timeout a wedged browser would hang the tool forever.
+// (/json/version, /json/close). They answer instantly while Chrome is alive.
+// Without a timeout a wedged browser would hang the tool forever.
 const CDP_HTTP_TIMEOUT_MS = 3_000;
 
 // `Page.navigate` normally answers in milliseconds, but it is dispatched
@@ -93,7 +95,7 @@ type StatusFn = (msg: string) => void;
 // raw mode and prints raw stderr writes on the input bar, so anything logged
 // unconditionally shows up as `[pi-search] ...` noise while typing. Messages
 // the user should actually see go through the tool's status callback instead
-// (see StatusFn); everything else is available with PI_SEARCH_DEBUG=1.
+// (see StatusFn). Everything else is available with PI_SEARCH_DEBUG=1.
 function debugLog(message: string): void {
   if (process.env.PI_SEARCH_DEBUG) console.error(`[pi-search] ${message}`);
 }
@@ -113,7 +115,7 @@ function envPath(name: string, ...segments: string[]): string | undefined {
 }
 
 // Candidate browser executables, most-preferred first. `CHROME_PATH` always
-// wins; then the platform's default install locations. Edge is last on
+// wins. Then the platform's default install locations. Edge is last on
 // Windows - it is Chromium-based and accepts the same CDP flags, so it
 // works as a fallback when Google Chrome is not installed.
 export function chromeCandidates(): string[] {
@@ -160,8 +162,8 @@ interface PendingCall {
   reject: (e: Error) => void;
 }
 
-// Minimal CDP interface used by runInPageSession. CDPClient implements this;
-// tests pass a fake so the navigate/waitForSelector/extract logic can be
+// Minimal CDP interface used by runInPageSession. CDPClient implements this.
+// Tests pass a fake so the navigate/waitForSelector/extract logic can be
 // exercised without a real browser or WebSocket.
 interface CDPLike {
   call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
@@ -306,7 +308,7 @@ let chromeLifecycle: Promise<unknown> = Promise.resolve();
 // Args of the Chrome started by *this* process (null when the live Chrome was
 // started elsewhere - an earlier Pi session using the same profile).
 let launchedArgs: string[] | null = null;
-// False once writing the launch marker has failed; disables restart-on-stale
+// False once writing the launch marker has failed. Disables restart-on-stale
 // logic (no marker means we would restart Chrome on every call).
 let canPersistLaunchArgs = true;
 
@@ -341,7 +343,7 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   // lazy-loaded content (infinite scroll, lazy images, GitHub's deferred
   // sections). The async self-scrolling extractors (X/Reddit/Amazon) hit the
   // same wall. These flags keep the renderer alive so scrolling works even
-  // when the tab isn't active; the bringToFront option (below) handles the
+  // when the tab isn't active. The bringToFront option (below) handles the
   // remaining visibility-dependent cases.
   "--disable-background-timer-throttling",
   "--disable-backgrounding-occluded-windows",
@@ -485,14 +487,14 @@ async function ensureChrome(status: StatusFn): Promise<void> {
     const desired = chromeLaunchArgs();
 
     if (await isChromeAlive()) {
-      // What were the running Chrome's flags? Our own record wins; otherwise
+      // What were the running Chrome's flags? Our own record wins. Otherwise
       // the marker file left by the process that launched it.
       const current = launchedArgs ?? readLaunchMarker();
       if (current && sameArgs(current, desired)) return;
 
       // Unknown flags (Chrome started by an older version, before the marker
       // existed). Restart it once so the current flags - including a proxy -
-      // are actually applied and recorded; if the marker can't be written we'd
+      // are actually applied and recorded. If the marker can't be written we'd
       // restart on every single call, so leave it alone instead.
       if (current === null && !canPersistLaunchArgs) return;
 
@@ -523,13 +525,13 @@ async function ensureChrome(status: StatusFn): Promise<void> {
 // up as a random "CDP call timeout" / connection error on the surviving call.
 function withChromeLifecycle<T>(fn: () => Promise<T>): Promise<T> {
   const run = chromeLifecycle.then(fn, fn);
-  // Keep the chain alive regardless of this operation's outcome; the caller
+  // Keep the chain alive regardless of this operation's outcome. The caller
   // still observes the rejection through the returned promise.
   chromeLifecycle = run.catch(() => undefined);
   return run;
 }
 
-// Stop the running Chrome (ours: signal it; started by another Pi session:
+// Stop the running Chrome (ours: signal it. Started by another Pi session:
 // ask it to close over CDP) and wait for the debugging port to go away.
 async function stopChrome(): Promise<void> {
   if (chromeProcess) {
@@ -629,8 +631,8 @@ interface RunInPageOptions {
   // don't steal focus.
   bringToFront?: boolean;
   // When true, resolve Google `/goto` redirect links in the open tab before
-  // returning the markdown (see src/google-links.ts). Used by googleSearch;
-  // requires the CDP client to receive `Network.responseReceived` events
+  // returning the markdown (see src/google-links.ts). Used by googleSearch.
+  // Requires the CDP client to receive `Network.responseReceived` events
   // (Network.enable is already called by this session).
   resolveGoogleRedirects?: boolean;
   onStatus: (msg: string) => void;
@@ -727,7 +729,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // and reload to the real document - an ordinary browser never sees that
   // first response. The frame id is recorded and matched against the main
   // frame after the fact because `responseReceived` arrives before
-  // `Page.frameNavigated`; iframe Document responses (ad/user-sync pages) are
+  // `Page.frameNavigated`. iframe Document responses (ad/user-sync pages) are
   // filtered out by that match.
   interface DocResponse {
     status: number;
@@ -795,12 +797,12 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     const first = latestMainDoc();
     if (!first || (first.status !== 403 && first.status !== 503)) return;
 
-    // Bot-check JS can be visibility-sensitive; activate the tab like a user
+    // Bot-check JS can be visibility-sensitive. Activate the tab like a user
     // opening the page would, even on paths that normally avoid focus theft.
     try {
       await cdp.call("Page.bringToFront");
     } catch {
-      // Non-fatal: some targets reject it; the launch flags still help.
+      // Non-fatal: some targets reject it. The launch flags still help.
     }
 
     if (first.challenge || (await looksLikeChallengePage(cdp))) {
@@ -870,7 +872,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   }
 
   // Make this the active tab before any scrolling. Tool tabs open in the
-  // background; Chrome suspends rendering for non-active tabs, so
+  // background. Chrome suspends rendering for non-active tabs, so
   // window.scrollTo() (dynamicScroll, below) and the self-scrolling inside
   // the async extractors would otherwise not trigger lazy-loaded content -
   // the "Scrolling for dynamic content..." step silently did nothing until
@@ -881,7 +883,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     try {
       await cdp.call("Page.bringToFront");
     } catch {
-      // Non-fatal: some targets reject it; the launch flags above still help.
+      // Non-fatal: some targets reject it. The launch flags above still help.
     }
     await sleep(150); // let the renderer resume before scrolling/extracting
   }
@@ -1037,15 +1039,61 @@ async function extractVia(
   return resolveHttpError(markdown, url);
 }
 
+// A Google search URL with SafeSearch explicitly off.
+//
+// The dedicated profile is anonymous and its signed-out SafeSearch choice is
+// "Off" (google.com/safesearch offers Filter / Blur / Off without an account),
+// so results are already unfiltered. Sending `safe=off` anyway keeps them that
+// way per request: it overrides a Filter/Blur choice saved in the profile, and
+// it asks for the "show everything" behaviour where Google's blur-by-default
+// for signed-out users would otherwise apply. If SafeSearch is *locked* (parental
+// controls, school/work network) Google ignores the parameter - nothing a
+// parameter can do about that.
+export function googleSearchUrl(query: string, opts?: { images?: boolean }): string {
+  const url = new URL("https://www.google.com/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("safe", "off");
+  if (opts?.images) url.searchParams.set("udm", "2");
+  return url.href;
+}
+
 export async function googleSearch(
   query: string,
   onStatus?: (msg: string) => void
 ): Promise<SearchResult> {
   const status = onStatus ?? (() => {});
-  const encodedQuery = encodeURIComponent(query);
-  const url = `https://www.google.com/search?q=${encodedQuery}`;
+  const url = googleSearchUrl(query);
   return extractVia(url, status, `Searching Google for: ${query}`,
     GOOGLE_SEARCH_JS, { clickConsent: true, initialWaitMs: 0, resolveGoogleRedirects: true });
+}
+
+export interface GoogleImageSearchOptions {
+  // How many image results to return (1-12, default 8).
+  count?: number;
+  onStatus?: (msg: string) => void;
+}
+
+// Google Images (`udm=2`): every result is the image URL plus the URL of the
+// page the image came from. The original image URL only exists in the preview
+// panel, so the extractor clicks through the tiles to resolve it (falling back
+// to Google's cached thumbnail) - see getGoogleImageSearchJs().
+export async function googleImageSearch(
+  query: string,
+  options?: GoogleImageSearchOptions
+): Promise<SearchResult> {
+  const status = options?.onStatus ?? (() => {});
+  const count = clampImageCount(options?.count);
+  const url = googleSearchUrl(query, { images: true });
+  return extractVia(url, status, `Searching Google Images for: ${query}`,
+    getGoogleImageSearchJs(count),
+    {
+      clickConsent: true,
+      // The preview panel only loads its (original) image in an active tab.
+      bringToFront: true,
+      waitForSelector: "[data-lpage], .isv-r",
+      waitForTimeoutMs: 10_000,
+      initialWaitMs: 1000,
+    });
 }
 
 // If the extraction returned an HTTP-error marker (set by runInPageSession
