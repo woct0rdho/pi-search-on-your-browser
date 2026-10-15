@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { runInPageSession, CHROME_LAUNCH_ARGS, googleSearchUrl, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
+import { runInPageSession, CHROME_LAUNCH_ARGS, googleSearchUrl, NAVIGATE_ATTEMPTS, NAVIGATE_TIMEOUT_MS, DOC_STATE_JS, chromeCandidates, chromeLaunchArgs, findChrome, chromeSpawnErrorMessage, type CDPLike, type RunInPageOptions } from "../../src/chrome.ts";
 import { DEFUDDLE_DRIVER_JS, getDefuddleBundle, defuddleBundlePath } from "../../src/extractors.ts";
 
 // Fake CDP
@@ -30,8 +30,16 @@ class FakeCDP implements CDPLike {
   evaluateResults: Map<string, string> = new Map();
   // What waitForSelector polls return: "true" (found) or "false" (absent).
   selectorFound = false;
-  // What the final extractor evaluate returns.
+  // What the extractor returns. `extractionQueue` (when non-empty) is shifted
+  // first, so a test can give the safety pass and the post-scroll pass
+  // different results.
   extractionResult = "extracted content";
+  extractionQueue: string[] = [];
+  // What `location.href` evaluates to (chrome-error and hijack checks).
+  // `locationHrefs` (when non-empty) is shifted first: the safety-extraction
+  // tests make the tab report the requested page and then a hijacked one.
+  locationHref = "https://example.com/page";
+  locationHrefs: string[] = [];
   // HTTP status to simulate for the main document response. Set before
   // calling runInPageSession to make Page.navigate emit a
   // Network.responseReceived event with this status. 0 = don't emit.
@@ -57,6 +65,14 @@ class FakeCDP implements CDPLike {
   // When true, Page.navigate never answers - but the page still loads, which
   // is what a slow navigation looks like when the load event fires first.
   navigateHangs = false;
+  // When true, Page.navigate never fires the load event (the page still
+  // answers the command), which is what ad frames and analytics do.
+  noLoadEvent = false;
+  // Queued responses for the pi-settle document-state probe, shifted per
+  // call. Defaults to a settled document.
+  settleStates: string[] = [];
+  // Every pi-settle probe response the session saw.
+  settleProbes: string[] = [];
   private loadHandlers: Array<(params: unknown) => void> = [];
   private networkHandlers: Array<(params: unknown) => void> = [];
   private frameHandlers: Array<(params: unknown) => void> = [];
@@ -118,7 +134,7 @@ class FakeCDP implements CDPLike {
       }
       if (method === "Page.navigate") {
         // Fire load handlers synchronously (registered before navigate).
-        for (const h of this.loadHandlers) h({});
+        if (!this.noLoadEvent) for (const h of this.loadHandlers) h({});
         if (this.navigateHangs) return new Promise<never>(() => {});
       }
       return {};
@@ -128,6 +144,12 @@ class FakeCDP implements CDPLike {
 
   async evaluate(expression: string): Promise<string> {
     this.evaluations.push(expression);
+    // waitForSettledDocument's probe (marked so the fake can find it).
+    if (expression.includes("/*pi-settle*/")) {
+      const state = this.settleStates.shift() ?? "body|complete|1000|https://example.com/page";
+      this.settleProbes.push(state);
+      return state;
+    }
     // waitForSelector polls look like: document.querySelector("...") !== null
     // cdp.evaluate stringifies the boolean -> "true" / "false" (the bug source).
     if (expression.startsWith("document.querySelector")) {
@@ -137,9 +159,15 @@ class FakeCDP implements CDPLike {
     if (expression.includes("document.title")) {
       return this.titleProbeText;
     }
+    if (expression === "location.href") {
+      const queued = this.locationHrefs.shift();
+      if (queued !== undefined) return queued;
+      return this.evaluateResults.get("location.href") ?? this.locationHref;
+    }
     if (this.evaluateResults.has(expression)) {
       return this.evaluateResults.get(expression)!;
     }
+    if (this.extractionQueue.length) return this.extractionQueue.shift()!;
     return this.extractionResult;
   }
 
@@ -548,6 +576,47 @@ test("5xx server errors are also surfaced", async () => {
   assert.ok(result.startsWith("__HTTP_ERROR__: 503"), `expected 503 marker, got: ${result}`);
 });
 
+// A 502 from a proxy/upstream is transient: reloading is what a user does.
+
+test("a transient 502 is retried once and then extracted", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 502, statusText: "Bad Gateway" }];
+  fake.reloadSequence = [{ status: 200, statusText: "OK", delayMs: 100 }];
+  fake.evaluateResults.set("myExtractor()", "content after the gateway recovered, long enough");
+
+  const result = await runInPageSession(fake, baseOpts({
+    js: "myExtractor()",
+    interstitialWaitMs: 2_000,
+    interstitialReloadWaitMs: 1_000,
+  }));
+
+  assert.equal(result, "content after the gateway recovered, long enough");
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Page.reload").length,
+    1,
+    "one F5, not a reload loop",
+  );
+  // A gateway error page is not a bot check: no challenge probe needed.
+  assert.ok(
+    !fake.evaluations.some((e) => e.includes("document.title")),
+    "must not probe for challenge markers on a 502",
+  );
+});
+
+test("a 502 that survives the reload is surfaced as an HTTP error", async () => {
+  const fake = new FakeCDP();
+  fake.docSequence = [{ status: 502, statusText: "Bad Gateway" }];
+
+  const result = await runInPageSession(fake, baseOpts({
+    js: "myExtractor()",
+    interstitialWaitMs: 2_000,
+    interstitialReloadWaitMs: 100,
+  }));
+
+  assert.ok(result.startsWith("__HTTP_ERROR__: 502"), `expected 502 marker, got: ${result}`);
+  assert.ok(!fake.evaluations.includes("myExtractor()"), "extractor must not run on the error page");
+});
+
 test("HTTP 200 proceeds normally (extraction runs, no error marker)", async () => {
   const fake = new FakeCDP();
   fake.docResponseStatus = 200;
@@ -798,6 +867,157 @@ test("Page.navigate passes the short timeout, other calls keep the default", asy
   assert.equal(navigate?.timeoutMs, NAVIGATE_TIMEOUT_MS);
   const evaluate = fake.calls.find((c) => c.method === "Network.enable");
   assert.equal(evaluate?.timeoutMs, undefined, "non-navigate calls use the client default");
+});
+
+// JS redirects / reloads replace the document after the load event. The session
+// must wait for the document to settle before extracting - otherwise it reads
+// the redirect stub, or throws because document.body is still null (seen on
+// jin115.com and baike.baidu.com).
+
+test("waits for the document to settle after a client-side redirect", async () => {
+  const fake = new FakeCDP();
+  fake.settleStates = [
+    "nobody|loading|0|https://example.com/stub",
+    "nobody|loading|0|https://example.com/final",
+    "body|complete|120|https://example.com/final",
+    "body|complete|120|https://example.com/final",
+  ];
+
+  await runInPageSession(fake, baseOpts());
+
+  // stub (no body) -> final URL (still no body) -> settled: the session keeps
+  // polling while the document is unsettled and extracts only at the end.
+  assert.equal(fake.settleProbes.length, 3, `probes: ${fake.settleProbes.join(" -> ")}`);
+  assert.ok(fake.settleProbes[fake.settleProbes.length - 1].includes("https://example.com/final"));
+  assert.ok(fake.evaluations.includes(DOC_STATE_JS), "the settle probe ran");
+});
+
+test("a document that already has content is not delayed (ad redirects)", async () => {
+  const fake = new FakeCDP();
+  // Content present, but the URL keeps changing (an ad script navigating the
+  // tab): the session must extract the page it has, not follow the ad.
+  fake.settleStates = [
+    "body|loading|5000|https://example.com/article",
+    "body|complete|5000|https://ads.example/click",
+    "body|complete|5000|https://ads.example/click",
+  ];
+
+  await runInPageSession(fake, baseOpts());
+
+  assert.equal(fake.settleProbes.length, 1, `should not wait on a page with content: ${fake.settleProbes.join(" -> ")}`);
+});
+
+test("an unrecognised settle response does not block (test fakes, odd pages)", async () => {
+  const fake = new FakeCDP();
+  fake.settleStates = ["not a state string"];
+
+  await runInPageSession(fake, baseOpts());
+
+  assert.equal(fake.settleProbes.length, 1, "one probe, then give up gracefully");
+});
+
+test("content-first proceeds as soon as the page has text", async () => {
+  const fake = new FakeCDP();
+  fake.noLoadEvent = true; // ad frames keep the load event from firing
+  fake.settleStates = [
+    "nobody|loading|0|https://example.com/page",
+    "body|complete|900|https://example.com/page",
+  ];
+
+  const t0 = Date.now();
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", contentFirst: true }));
+
+  assert.equal(result, "extracted content");
+  assert.ok(Date.now() - t0 < 5000, "must not wait out the full load timeout");
+  assert.ok(fake.settleProbes.length >= 2, "polled until the text was there");
+});
+
+// A navigation that lands on Chrome's error page is usually a transient
+// transport failure when several visits load at once through a proxy.
+
+test("re-navigates once when the tab lands on Chrome's error page", async () => {
+  const fake = new FakeCDP();
+  fake.locationHrefs = ["chrome-error://chromewebdata/", "https://example.com/page"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.equal(result, "extracted content");
+  assert.equal(fake.calls.filter((c) => c.method === "Page.navigate").length, 2);
+});
+
+test("reports the navigation error when the retry fails too", async () => {
+  const fake = new FakeCDP();
+  fake.locationHrefs = ["chrome-error://chromewebdata/", "chrome-error://chromewebdata/"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.equal(result, "__NAV_ERROR__: https://example.com/page");
+  assert.equal(fake.calls.filter((c) => c.method === "Page.navigate").length, 2);
+});
+
+// Ad/anti-bot scripts navigate the whole tab away a few seconds after load
+// (`location.href = adUrl`), which used to turn a good extraction into an ad
+// page or a chrome-error page (hmv.co.jp, oricon.co.jp, koenote.info, ...).
+// visit_page therefore extracts right after the page settles and only keeps
+// the post-scroll result if the tab is still on the requested page.
+
+test("keeps the pre-scroll extraction when the page navigated away", async () => {
+  const fake = new FakeCDP();
+  fake.extractionQueue = ["SAFETY: ".padEnd(120, "s"), "AD PAGE: ".padEnd(60, "a")];
+  // First location.href settles the session, the second is the hijack check
+  // after the post-scroll extraction.
+  fake.locationHrefs = ["https://example.com/page", "https://ads.example/landing"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", safetyExtract: true }));
+
+  assert.ok(result.startsWith("SAFETY:"), `expected the pre-scroll copy, got: ${result}`);
+  assert.equal(
+    fake.evaluations.filter((e) => e === "extractor()").length,
+    2,
+    "the page is extracted before and after the scrolling",
+  );
+});
+
+test("keeps the richer copy when the page left after loading only a skeleton", async () => {
+  const fake = new FakeCDP();
+  fake.extractionQueue = ["SKELETON: ".padEnd(60, "s"), "REAL CONTENT: ".padEnd(120, "r")];
+  fake.locationHrefs = ["https://example.com/page", "https://ads.example/landing"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", safetyExtract: true }));
+
+  assert.ok(result.startsWith("REAL CONTENT:"), `expected the longer copy, got: ${result}`);
+});
+
+test("a mirror redirect is not a hijack", async () => {
+  const fake = new FakeCDP();
+  fake.extractionQueue = ["SKELETON: ".padEnd(60, "s"), "REAL CONTENT: ".padEnd(120, "r")];
+  // The site moved the tab to its mirror domain while the page settled.
+  fake.locationHrefs = ["https://kako.5ch.io/thread", "https://kako.5ch.io/thread"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", safetyExtract: true }));
+
+  assert.ok(result.startsWith("REAL CONTENT:"), `expected the post-scroll copy, got: ${result}`);
+});
+
+test("prefers the post-scroll extraction when the page stayed", async () => {
+  const fake = new FakeCDP();
+  fake.extractionQueue = ["SAFETY: ".padEnd(60, "s"), "LAZY: ".padEnd(60, "l")];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", safetyExtract: true }));
+
+  assert.ok(result.startsWith("LAZY:"), `expected the richer post-scroll copy, got: ${result}`);
+});
+
+test("extracts once unless the safety pass is requested", async () => {
+  const fake = new FakeCDP();
+
+  await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.equal(
+    fake.evaluations.filter((e) => e === "extractor()").length,
+    1,
+    "specialized extractors scroll themselves and must not run twice",
+  );
 });
 
 // Chrome launch flags (keep renderer alive in background)

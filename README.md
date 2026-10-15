@@ -10,6 +10,8 @@ Search Google and browse the web in your own visible Chrome browser - no API key
 - `clean` extraction - reader-mode markdown via [Defuddle](https://github.com/kepano/defuddle) (the Obsidian Web Clipper library). Drops nav/sidebars/ads, ~47% fewer tokens on docs pages
 - `summary` subagent - pass `summary: true`, get only a concise summary of the whole page back (the full page never enters your chat context). Reuses your current Pi model by default, no setup needed
 - HTTP error detection - dead links return a clear `isError` with status-specific hints instead of error-page gibberish. Bot-check 403s are waited out like a real browser
+- Generic pages come back as main text plus inline links and image URLs, an `## Images` list, and a `## Navigation` list (next/previous page, article list, original source)
+- Holds up on niche and legacy sites: plain `http://`, JavaScript/meta-refresh redirects, and pages whose ad scripts navigate the tab away mid-visit
 - Site-specific extractors - X/Twitter (structured tweets), Reddit (posts + threaded comments), Amazon (products + search), Google Scholar (papers)
 
 > "If you need AI to do a search for you in the real world, ds4-agent is basically SOTA, because it can access the web sites without any limitations given that it uses your local Chrome browser (no, not in headless mode, that's the trick...)"
@@ -22,7 +24,7 @@ Inspired by the [ds4-agent](https://github.com/antirez/ds4) approach by @antirez
 When you call `google_search`, `google_image_search`, or `visit_page`:
 - A visible Chrome window opens (not headless) with a dedicated profile at `~/.pi-search-browser/`
 - Chrome DevTools Protocol (CDP) is used to navigate and extract content
-- JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar. [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`. Generic block-walker as fallback
+- JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar. [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`. Generic pages come back as main text plus images and navigation links
 - Chrome stays alive between calls for speed (kill with `/google-search-kill`)
 
 ## Tools
@@ -86,7 +88,6 @@ known) the image size:
 ### `visit_page`
 
 Visit any URL and get the page content as markdown. Two parameters keep large pages from filling your conversation:
-
 - `summary` - delegate to a subagent model that returns only a concise summary of the whole page (the raw page never enters your context, reuses your current model by default). [See below.](#optional-summary--keep-your-chat-context-small)
 - `clean` - extract with Defuddle reader-mode (drops nav/sidebars/ads, ~47% fewer tokens). [See below.](#optional-clean--clean-article-markdown-via-defuddle)
 
@@ -213,6 +214,55 @@ parameter is removed and every mention of it disappears - including the
 description. The default page extraction is always used. Clean and summary mode
 are independent: disabling either leaves the other untouched.
 
+### What the generic extraction returns
+
+Generic (non-specialized) pages are read by an in-page walker that takes the
+page apart the way a person skimming it would. The markdown has up to four
+sections:
+- `## Content` - the main text: headings, paragraphs, list items, quotes, table
+  cells. Links inside the text stay inline (`[text](url)`), images too
+  (`![alt](url)`).
+- `## Images (N)` - the page's content images, resolved from `srcset` (best
+  candidate), `currentSrc`, and the usual lazy-load attributes (`data-src`,
+  `data-original`, `data-lazy-src`, `data-echo`, ...). Icons, spacers, and
+  images smaller than 64px are skipped. At most 60 are listed.
+- `## Navigation` - navigation back to the site's content: declared
+  (`<link rel=next|prev|up|contents|...>`, `a[rel]`) and heuristic
+  (next/previous page, article list, index, original source, pagination).
+- `## Visible links` - the remaining visible links (120 max).
+
+`nav`/`aside`/`header`/`footer` and their ARIA-landmark equivalents are
+skipped, so the text is not diluted by site chrome. Use `clean: true` when you
+want a single article and nothing else. The default extraction is what keeps
+comments, image galleries, and the links out.
+
+### Niche and legacy sites
+
+The long tail of the web is not article-shaped, and a specialized extractor is
+not worth writing per site. What the tool does for those pages:
+- Plain `http://` works. Chrome's automatic HTTPS upgrades are disabled
+  (`HttpsUpgrades`, `HttpsFirstModeV2`, ...), because the sites that never got
+  a certificate would otherwise be replaced by `ERR_BLOCKED_BY_CLIENT` before
+  the request is even made.
+- JavaScript redirects, meta refreshes, and `document.write` reloads are
+  waited out (`waitForSettledDocument`): the extraction runs on the page the
+  redirect lands on, not on the redirect stub, and not while `document.body`
+  is still null.
+- Ad/anti-bot scripts that navigate the tab away a few seconds after load no
+  longer cost the extraction: a copy is taken as soon as the page settles, and
+  it is what gets returned if the tab has left the page you asked for by the
+  time scrolling and waiting are done.
+- Extraction starts as soon as the page has text instead of waiting for the
+  load event, which ad frames and analytics can delay for ten seconds - the
+  text is usually there long before, and extracting earlier is what keeps a
+  hijack from happening first.
+- A navigation that ends on Chrome's error page (transient proxy/DNS/TLS
+  failures are common when several calls run at once) is re-navigated once
+  before the tool reports a navigation error.
+- Sites that answer every request from a fresh IP with a challenge remain
+  outside what an extraction tool can do. The visible Chrome window can clear
+  those interactively, and the cookie stays in the profile.
+
 ### Optional `clean` - clean article Markdown via Defuddle
 
 By default, `visit_page` on a generic (non-specialized) page uses a naive
@@ -279,7 +329,10 @@ browser never shows the user that first response. `visit_page` now tracks every
 document response per frame (an ad/iframe `Document` response cannot mask the
 main page), keeps the tab open on a 403/503, activates it, and waits up to 15s
 for the self-reload before believing the error. A 403/503 *without* challenge
-markers gets one `Page.reload` retry instead (the F5 move). If the challenge
+markers gets one `Page.reload` retry instead (the F5 move). A 5xx does too: a
+gateway error from a proxy or upstream (a plain `http://` page answering 502
+while the same URL loads fine seconds later) is just as transient, and one
+reload is what a user does about it. If the challenge
 still does not clear, the result is `HTTP 403 Bot challenge not passed` with a
 hint to open the visible Chrome window - the clearance cookie it obtains stays
 in the profile, so the next attempt succeeds. The tool also no longer enables
@@ -293,7 +346,7 @@ Status-specific hints:
 | 404 | Page doesn't exist - try a different URL or search |
 | 403 | Access denied or an unresolved bot check - the visible Chrome window can clear it, then retry |
 | 429 | Rate limited - wait and retry |
-| 5xx | Server error - retry shortly or try a different URL |
+| 5xx | Server or gateway error - the tool reloads once. If it persists, retry shortly or try a different URL |
 
 ## Commands
 
@@ -339,7 +392,6 @@ it used to be fragile, and a real session shows why: two parallel GitHub
 visits through a slow proxy took ~32s each, and the fixed 30s per-call CDP
 timeout failed one of them with `visit_page failed: CDP call timeout:
 Page.navigate`. Three things handle that now:
-
 - `Page.navigate` is retried. Each attempt gets 15s. After a timeout the
   navigation is re-issued (up to 3 attempts). The command is idempotent for a
   fixed URL, so a retry either picks up the load that already started or
@@ -467,11 +519,10 @@ pnpm install
 pnpm test
 ```
 
-Seven layers of tests (129 total):
-
+Seven layers of tests (140 total):
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget.
+- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget. Client-side redirects are waited out (`waitForSettledDocument`), the pre-scroll extraction is kept when the page navigates away mid-visit, a tab that lands on Chrome's error page re-navigates once, and specialized extractors still run exactly once.
 - `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
 - `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.

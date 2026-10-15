@@ -111,7 +111,7 @@ export function visitPageSurface(options: VisitPageOptions): VisitPageSurface {
 
 // The `visit_page` parameter schema for the current config.
 //
-// An enabled feature's parameter is required; a disabled one is removed from
+// An enabled feature's parameter is required. A disabled one is removed from
 // both `properties` and `required`, so the schema stays valid and never asks
 // for a hidden feature. The static type keeps both parameters: a disabled
 // feature's key is absent at run time, so index.ts reads them only behind their

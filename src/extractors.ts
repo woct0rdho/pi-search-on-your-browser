@@ -17,9 +17,6 @@ import { createRequire } from "node:module";
 
 // Google consent + search
 
-// Backtick constant for building JS strings that contain backticks
-const BT = "`";
-
 // NOTE: deliberately does NOT match <a> tags. Clicking an anchor navigates
 // away from the target page. Cookie-consent "accept" buttons are always
 // <button>/<input>/[role=button], never <a>. Patterns are anchored (^...$)
@@ -63,10 +60,10 @@ export const GOOGLE_SEARCH_JS =
 
 // Google Images (`udm=2`). Each result tile carries the source page URL in
 // `data-lpage`, the page title in the thumbnail's `alt`, and a Google-hosted
-// thumbnail in `src`. The original image URL is *not* in the grid: it only
+// thumbnail in `src`. The original image URL is not in the grid: it only
 // appears in the preview panel after a tile is clicked, where Google first
-// shows the cached thumbnail and then swaps in the original (measured: 0.5-4s;
-// on hosts that block hotlinking - e.g. Facebook - it stays cached). So the
+// shows the cached thumbnail and then swaps in the original (measured: 0.5-4s.
+// On hosts that block hotlinking - e.g. Facebook - it stays cached). So the
 // driver clicks through the tiles and reports the original when it arrives,
 // falling back to the cached thumbnail otherwise. Tiles that don't get their
 // turn before the deadline are reported from the grid data alone, which keeps
@@ -74,7 +71,7 @@ export const GOOGLE_SEARCH_JS =
 export const GOOGLE_IMAGE_SEARCH_DEFAULT_COUNT = 8;
 export const GOOGLE_IMAGE_SEARCH_MAX_COUNT = 12;
 
-/** Clamp a caller-supplied result count into [1, MAX]; non-numbers use the default. */
+// Clamp a caller-supplied result count into [1, MAX]. Non-numbers use the default.
 export function clampImageCount(value: unknown): number {
   const n =
     typeof value === "number"
@@ -91,7 +88,7 @@ export function getGoogleImageSearchJs(count: number): string {
   return `(async () => {
   const MAX = ${max};
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  // The runtime evaluate budget is 30s; return comfortably inside it. Tiles the
+  // The runtime evaluate budget is 30s. Return comfortably inside it. Tiles the
   // deadline cuts off are still reported, from the grid data (cached thumb).
   const deadline = Date.now() + 20000;
   const clean = s => (s || "").replace(/\\s+/g, " ").trim();
@@ -113,7 +110,7 @@ export function getGoogleImageSearchJs(count: number): string {
     return href;
   };
 
-  // Modern tiles carry the source page in data-lpage; the pre-2023 layout uses
+  // Modern tiles carry the source page in data-lpage. The pre-2023 layout uses
   // .isv-r with a /url?q= anchor and data-src on the thumbnail.
   let tiles = [...document.querySelectorAll("[data-lpage]")];
   if (!tiles.length) tiles = [...document.querySelectorAll(".isv-r")];
@@ -139,7 +136,7 @@ export function getGoogleImageSearchJs(count: number): string {
 
   // One preview panel serves every tile, sequentially: give each tile a slice
   // of the time budget - fewer results means more patience per image. Originals
-  // that do load typically appear within ~1s; hosts that block hotlinking never
+  // that do load typically appear within ~1s. Hosts that block hotlinking never
   // swap, so waiting longer only costs time.
   const perItem = Math.max(1200, Math.min(5000, Math.floor(10000 / items.length)));
 
@@ -150,12 +147,12 @@ export function getGoogleImageSearchJs(count: number): string {
       try {
         item.el.scrollIntoView({ block: "center" });
         await sleep(200);
-        // The panel may still be showing the previous tile's image; ignore it.
+        // The panel may still be showing the previous tile's image. Ignore it.
         const panelBefore = document.querySelector('img[jsname="kn3ccd"], img.sFlh5c');
         const before = panelBefore ? panelBefore.getAttribute("src") || "" : "";
         item.img.click();
         // Google first shows its cached thumbnail, then swaps in the original
-        // when that has loaded (usually <1s; some hosts block hotlinking and
+        // when that has loaded (usually <1s. Some hosts block hotlinking and
         // never swap - e.g. Facebook - so the window is bounded).
         const until = Math.min(deadline, Date.now() + perItem);
         while (Date.now() < until) {
@@ -191,37 +188,196 @@ export function getGoogleImageSearchJs(count: number): string {
 }
 
 // Generic page extractor (fallback / default)
-
-export const EXTRACT_PAGE_JS =
-  "(() => {" +
-  'const clean=s=>(s||"").replace(/\\s+/g," ").trim();' +
-  'const esc=s=>clean(s).replace(/\\\\/g,"\\\\\\\\").replace(/\\[/g,"\\\\[").replace(/\\]/g,"\\\\]").replace(/\\n/g," ");' +
-  'const visible=el=>{const r=el.getBoundingClientRect();const st=getComputedStyle(el);return r.width>0&&r.height>0&&st.display!=="none"&&st.visibility!=="hidden"&&st.opacity!=="0";};' +
-  "const inline=n=>{if(!n)return'';if(n.nodeType===3)return n.nodeValue;if(n.nodeType!==1)return'';const el=n;" +
-  'if(el.tagName==="SCRIPT"||el.tagName==="STYLE"||el.tagName==="NOSCRIPT")return"";' +
-  'if(el.tagName==="A"){const t=esc(el.innerText||el.textContent);const h=el.href||"";return t&&h?"["+t+"]("+h+")":t;}' +
-  'if(el.tagName==="CODE")return"' + BT + '"+clean(el.innerText||el.textContent).replace(/`/g,"\\\\\\\\' + BT + '")+"' + BT + '";' +
-  "return[...el.childNodes].map(inline).join('');};" +
-  'const lines=["# "+(clean(document.title)||location.href),"","URL: "+location.href,"","## Content"];' +
-  'const blocks=[...document.body.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,td,th")];' +
-  "const seen=new Set();" +
-  "for(const el of blocks){" +
-  'if(!visible(el))continue;let s="";const tag=el.tagName;' +
-  'if(/^H[1-6]$/.test(tag)){s="#".repeat(Number(tag[1]))+" "+inline(el);}' +
-  'else if(tag==="LI"){s="- "+inline(el);}' +
-  'else if(tag==="PRE"){s="' + BT + BT + BT + '\\n"+(el.innerText||el.textContent||"").trimEnd()+"\\n' + BT + BT + BT + '";}' +
-  'else if(tag==="BLOCKQUOTE"){s="> "+clean(el.innerText||el.textContent);}' +
-  "else{s=inline(el);}" +
-  "s=s.trim();if(!s||seen.has(s))continue;seen.add(s);" +
-  'lines.push("",s);if(lines.join("\\n").length>90000){lines.push("","[Content truncated by browser extractor.]");break;}}' +
-  'lines.push("","## Visible links");let n=0;const linkSeen=new Set();' +
-  'for(const a of document.querySelectorAll("a[href]")){' +
-  "if(!visible(a))continue;const t=esc(a.innerText||a.textContent);if(t.length<3)continue;" +
-  "let u;try{u=new URL(a.href)}catch{continue;}" +
-  "if(!/^https?:$/.test(u.protocol)||linkSeen.has(u.href))continue;linkSeen.add(u.href);" +
-  'lines.push("- ["+t.slice(0,160)+"]("+u.href+")");if(++n>=80)break;}' +
-  'return lines.join("\\n");' +
-  "})()";
+//
+// A reader for the wild web rather than for article layouts: blogs, forums
+// (5ch keeps its posts in <dd>), wikis, galleries, listing/product pages, old
+// table-based sites. Sections, in order:
+//
+//   ## Content       the main text, with hyperlinks and images inline
+//   ## Images        every content image (URL + alt + size), including ones
+//                    that carry no text of their own (galleries)
+//   ## Navigation    declared (rel=next/prev/up/contents) and detected
+//                    (text/aria heuristics, pagination) links, so the agent
+//                    can reach the next page, the index, or the original
+//   ## Visible links the remaining visible links, for exploration
+//
+// It is null-safe (document.body is null on Chrome error pages and briefly
+// mid-reload) and the text section is capped independently of the trailing
+// sections, so navigation/images survive a huge article.
+export const EXTRACT_PAGE_JS = `(() => {
+  const doc = document;
+  const root = doc.body || doc.documentElement;
+  if (!root) return "__NAV_ERROR__: " + location.href;
+  const clean = s => (s || "").replace(/\\s+/g, " ").trim();
+  const esc = s => clean(s).replace(/\\\\/g, "\\\\\\\\").replace(/\\[/g, "\\\\[").replace(/\\]/g, "\\\\]");
+  const fence = String.fromCharCode(96).repeat(3);
+  const abs = u => { try { const x = new URL(u, location.href); return /^https?:$/.test(x.protocol) ? x.href : ""; } catch (e) { return ""; } };
+  const visible = el => {
+    try {
+      const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden" && st.opacity !== "0";
+    } catch (e) { return false; }
+  };
+  // images
+  const SKIP_IMG = /sprite|\\/icons?\\/|icon\\.|logo\\.|avatar|spacer|blank\\.(gif|png)|pixel\\.(gif|png)|1x1|loading\\.(gif|png)|transparent\\.(gif|png)|emoji|rating|badge|banner/i;
+  const imgSrc = img => {
+    const cands = [img.currentSrc, img.getAttribute("src"), img.getAttribute("data-src"), img.getAttribute("data-original"), img.getAttribute("data-lazy-src"), img.getAttribute("data-echo"), img.getAttribute("data-url")];
+    for (const v of cands) if (v && !/^data:/i.test(v)) { const a = abs(v); if (a) return a; }
+    const srcset = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+    if (srcset) {
+      const best = srcset.split(",").map(s => s.trim().split(/\\s+/)).sort((a, b) => (parseFloat(b[1]) || 0) - (parseFloat(a[1]) || 0))[0];
+      if (best && best[0] && !/^data:/i.test(best[0])) return abs(best[0]);
+    }
+    return "";
+  };
+  const seenImg = new Set();
+  const images = [];
+  const note = img => {
+    const src = imgSrc(img);
+    if (!src) return null;
+    const w = img.naturalWidth || img.width || 0, h = img.naturalHeight || img.height || 0;
+    const cls = String(img.className || "") + " " + String(img.id || "");
+    if (SKIP_IMG.test(src) || SKIP_IMG.test(cls) || (img.getAttribute("width") || "") === "1") return null;
+    if (w && h && w < 64 && h < 64) return null;
+    const alt = clean(img.alt || img.getAttribute("title") || "");
+    if (!seenImg.has(src)) { seenImg.add(src); images.push({ src: src, alt: alt, w: w, h: h }); }
+    return { src: src, alt: alt };
+  };
+  // inline text (links + images)
+  const SKIP_INLINE = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|CANVAS|IFRAME|BUTTON|SELECT|OPTION|TEXTAREA|INPUT)$/;
+  const inline = n => {
+    if (!n) return "";
+    if (n.nodeType === 3) return n.nodeValue;
+    if (n.nodeType !== 1) return "";
+    const el = n;
+    if (SKIP_INLINE.test(el.tagName)) return "";
+    if (el.tagName === "IMG") { const i = note(el); return i ? "![" + esc(i.alt) + "](" + i.src + ")" : ""; }
+    if (el.tagName === "BR") return " ";
+    const inner = () => [...el.childNodes].map(inline).join("");
+    if (el.tagName === "A") {
+      const t = esc(el.innerText || el.textContent);
+      const h = abs(el.getAttribute("href"));
+      const imgs = (inner().match(/!\\[[^\\]]*\\]\\([^)]+\\)/g) || []).join(" ");
+      if (t && h) return "[" + t + "](" + h + ")" + (imgs ? " " + imgs : "");
+      return t || imgs;
+    }
+    return inner();
+  };
+  // main text: walk blocks, emit leaf blocks with their inline content
+  const BLOCK = new Set("ADDRESS ARTICLE ASIDE BLOCKQUOTE DD DETAILS DIALOG DIV DL DT FIELDSET FIGCAPTION FIGURE FOOTER FORM H1 H2 H3 H4 H5 H6 HEADER LI MAIN NAV OL P PRE SECTION SUMMARY TABLE TBODY TD TFOOT TH THEAD TR UL".split(" "));
+  const blockish = el => {
+    if (BLOCK.has(el.tagName)) return true;
+    try { return /^(block|flex|grid|table|list-item|flow-root)/.test(getComputedStyle(el).display); } catch (e) { return false; }
+  };
+  const CHROME_TAG = /^(NAV|ASIDE|FOOTER|HEADER|DIALOG)$/;
+  const CHROME_ROLE = /^(navigation|banner|contentinfo|search|dialog|complementary)$/;
+  const chromeEl = el => CHROME_TAG.test(el.tagName) || CHROME_ROLE.test(el.getAttribute("role") || "");
+  const out = [];
+  const seenBlock = new Set();
+  let outLen = 0;
+  const MAX = 120000;
+  const push = s => {
+    s = (s || "").trim();
+    if (!s || seenBlock.has(s)) return;
+    seenBlock.add(s);
+    out.push(s);
+    outLen += s.length + 1;
+  };
+  const walk = el => {
+    if (!el || el.nodeType !== 1 || !el.tagName || outLen > MAX) return;
+    if (chromeEl(el)) return;
+    const tag = el.tagName;
+    if (SKIP_INLINE.test(tag) || tag === "VIDEO" || tag === "AUDIO") return;
+    let hasBlock = false;
+    for (const c of el.children) if (blockish(c)) { hasBlock = true; break; }
+    if (!hasBlock) {
+      if (!visible(el)) return;
+      if (tag === "PRE") { const t = (el.innerText || el.textContent || "").replace(/\\s+$/, ""); if (t) push(fence + "\\n" + t + "\\n" + fence); return; }
+      const text = clean(inline(el));
+      if (!text) return;
+      if (/^H[1-6]$/.test(tag)) push("#".repeat(Number(tag[1])) + " " + text);
+      else if (tag === "LI") push("- " + text);
+      else if (tag === "BLOCKQUOTE") push("> " + text);
+      else push(text);
+      return;
+    }
+    for (const c of el.children) walk(c);
+  };
+  const container = doc.querySelector("main, article, [role=main], #content, #main, .entry-content, .post-content, .article-body, .article-content, .content-body") || root;
+  walk(container);
+  if (out.length < 3 && container !== root) walk(root);
+  // galleries/lightboxes: images that never appeared in the text
+  for (const img of doc.querySelectorAll("img")) {
+    if (images.length >= 60) break;
+    if (img.closest("nav, header, footer, aside")) continue;
+    note(img);
+  }
+  // navigation links
+  const navRe = /(^|[^a-z])(next|previous|prev|back|index|contents?|up|first|last|older|newer|more)([^a-z]|$)|次へ|次ページ|次のページ|前へ|前ページ|前のページ|戻る|もどる|一覧|記事一覧|目次|インデックス|トップ|ホーム|続きを読む|次の記事|前の記事|»|«|→|←/i;
+  const nav = [];
+  const navSeen = new Set();
+  const addNav = (url, text, rel) => {
+    if (!url || navSeen.has(url) || nav.length >= 20) return;
+    navSeen.add(url);
+    nav.push("- " + (text ? esc(text) : (rel || url)) + (rel ? " [" + rel + "]" : "") + ": " + url);
+  };
+  for (const l of doc.querySelectorAll("link[rel][href], a[rel][href]")) {
+    const rel = (l.getAttribute("rel") || "").toLowerCase();
+    if (!/(^|\\s)(next|prev|previous|up|contents|first|last|index|canonical)(\\s|$)/.test(rel)) continue;
+    addNav(abs(l.getAttribute("href")), clean(l.textContent || l.innerText || ""), rel);
+  }
+  for (const a of doc.querySelectorAll("a[href]")) {
+    if (!visible(a)) continue;
+    const label = clean(a.innerText || a.textContent || "") || clean(a.getAttribute("aria-label") || "") || clean(a.getAttribute("title") || "");
+    if (!label && !a.querySelector("img")) continue;
+    const rel = (a.getAttribute("rel") || "").toLowerCase();
+    const href = a.getAttribute("href") || "";
+    // Ad and tracking URLs carry a p= parameter too, so only a numeric page
+    // number counts as pagination. Code snippets in an article body are long,
+    // escaped-markup labels that would otherwise read as navigation.
+    const pager = (() => {
+      const path = href.split(/[?#]/)[0];
+      const seg = path.slice(path.lastIndexOf("/") + 1);
+      const pathPage = path.includes("/page/") && seg.length > 0 && !isNaN(Number(seg));
+      const query = (() => {
+        const at = href.indexOf("?");
+        if (at < 0) return false;
+        for (const pair of href.slice(at + 1).split(/[&;]/)) {
+          const eq = pair.indexOf("=");
+          if (eq < 0) continue;
+          const key = pair.slice(0, eq).toLowerCase();
+          const value = pair.slice(eq + 1);
+          if ((key === "page" || key === "paged" || key === "pg" || key === "p") &&
+              value.length > 0 && !isNaN(Number(value))) return true;
+        }
+        return false;
+      })();
+      return (pathPage || query) && label.length <= 24;
+    })();
+    if (label.startsWith("<") || rel.includes("sponsored")) continue;
+    if (navRe.test(label) || rel.includes("next") || rel.includes("prev") || pager) {
+      addNav(abs(href), label.slice(0, 40), rel);
+    }
+  }
+  // trailing sections
+  const imgLines = images.slice(0, 60).map(i => "- " + (i.alt ? esc(i.alt) + " " : "") + (i.w && i.h ? "(" + i.w + "x" + i.h + ") " : "") + i.src);
+  const links = [];
+  const linkSeen = new Set();
+  for (const a of doc.querySelectorAll("a[href]")) {
+    if (!visible(a)) continue;
+    const t = esc(a.innerText || a.textContent);
+    const u = abs(a.getAttribute("href"));
+    if (!u || t.length < 2 || linkSeen.has(u)) continue;
+    linkSeen.add(u);
+    links.push("- [" + t.slice(0, 160) + "](" + u + ")");
+    if (links.length >= 120) break;
+  }
+  const parts = ["# " + (clean(doc.title) || location.href), "", "URL: " + location.href, "", "## Content", out.join("\\n")];
+  if (imgLines.length) parts.push("", "## Images (" + images.length + ")", imgLines.join("\\n"));
+  if (nav.length) parts.push("", "## Navigation", nav.join("\\n"));
+  if (links.length) parts.push("", "## Visible links", links.join("\\n"));
+  return parts.join("\\n");
+})()`;
 
 // Defuddle (clean article extraction)
 // Defuddle (MIT, by Steph Ango / @kepano - the library behind the Obsidian
@@ -229,7 +385,7 @@ export const EXTRACT_PAGE_JS =
 // (`defuddle/full` -> `dist/index.full.js`) is a self-contained UMD bundle
 // that exposes `window.Defuddle` when injected into a page.
 //
-// The *full* entry is required, not the default one: only it bundles the
+// The full entry is required, not the default one: only it bundles the
 // Turndown-based HTML -> Markdown converter, so `{ markdown: true }` actually
 // produces Markdown (the slim entry silently ignores the option and returns
 // HTML) - plus MathML/Temml rendering for math-heavy pages.

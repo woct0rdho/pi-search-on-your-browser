@@ -305,7 +305,7 @@ let chromeProcess: ChildProcess | null = null;
 // Serializes Chrome start/restart decisions across parallel tool calls (see
 // withChromeLifecycle). Also covers shutdownChrome().
 let chromeLifecycle: Promise<unknown> = Promise.resolve();
-// Args of the Chrome started by *this* process (null when the live Chrome was
+// Args of the Chrome started by this process (null when the live Chrome was
 // started elsewhere - an earlier Pi session using the same profile).
 let launchedArgs: string[] | null = null;
 // False once writing the launch marker has failed. Disables restart-on-stale
@@ -349,7 +349,7 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "--disable-backgrounding-occluded-windows",
   "--disable-renderer-backgrounding",
   // Chrome's native window-occlusion detection (CalculateNativeWinOcclusion)
-  // can fully freeze the renderer when the Chrome *window* is behind another
+  // can fully freeze the renderer when the Chrome window is behind another
   // window or unfocused - even with the three flags above. This shows up as
   // a full 30s Runtime.evaluate timeout (the renderer stops responding to
   // CDP entirely), not just missed lazy loads. It is especially severe on
@@ -360,7 +360,15 @@ export const CHROME_LAUNCH_ARGS: readonly string[] = [
   // work with Chrome in the background. Without this flag, visit_page on
   // lazy-load pages (e.g. github.com) hangs unless the user manually focuses
   // the Chrome window first.
-  "--disable-features=CalculateNativeWinOcclusion",
+  //
+  // The HTTPS flags keep plain-HTTP pages reachable. Chrome upgrades an
+  // `http://` navigation to `https://`. On the many niche/legacy sites that
+  // have no HTTPS endpoint the upgrade fails and the tab lands on
+  // `chrome-error://chromewebdata/` instead of the page (this is exactly what
+  // happened to blog.esuteru.com, vippers.jp, blog.livedoor.jp in testing,
+  // although all three serve fine over HTTP). We are a local browsing tool,
+  // not a security product: no automatic HTTPS upgrades, no HTTPS-only mode.
+  "--disable-features=CalculateNativeWinOcclusion,HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode,HttpsFirstModeIncognito",
   "about:blank",
 ];
 
@@ -635,6 +643,18 @@ interface RunInPageOptions {
   // Requires the CDP client to receive `Network.responseReceived` events
   // (Network.enable is already called by this session).
   resolveGoogleRedirects?: boolean;
+  // When true, extract once right after the page settles and once after the
+  // waits/scrolling, returning the second only if the page is still there.
+  // Ad/anti-bot scripts that navigate the tab away a few seconds after load
+  // then cost nothing. Default false: the specialized extractors scroll
+  // themselves and must run exactly once.
+  safetyExtract?: boolean;
+  // When true, proceed as soon as the document has text instead of waiting for
+  // the load event - ad frames and analytics frequently keep that event from
+  // firing for the full timeout while the text has been rendered for seconds.
+  // Used by visit_page's generic extraction. The specialized extractors wait
+  // for their own selectors instead.
+  contentFirst?: boolean;
   onStatus: (msg: string) => void;
 }
 
@@ -644,7 +664,7 @@ interface RunInPageOptions {
 //  - The page may finish loading while the command's reply is still stuck in
 //    the browser - exactly what a slow proxy or a saturated network looks
 //    like. The load event wins the race, so the call proceeds normally.
-//  - A timeout is retried (up to NAVIGATE_ATTEMPTS). Errors that are *not*
+//  - A timeout is retried (up to NAVIGATE_ATTEMPTS). Errors that are not
 //    timeouts - a closed CDP socket, a rejected command - are fatal and are
 //    re-thrown immediately: retrying on a dead connection is pointless.
 async function navigateToPage(
@@ -695,6 +715,50 @@ async function looksLikeChallengePage(cdp: CDPLike): Promise<boolean> {
   }
 }
 
+// Page-state probe used by waitForSettledDocument():
+// "<body?>|<readyState>|<textLength>|<href>". The `pi-settle` marker lets the
+// unit-test fake recognise this evaluation.
+export const DOC_STATE_JS =
+  "(() => { /*pi-settle*/ try { const b = document.body; return (document.documentElement ? (b ? 'body' : 'nobody') : 'nodoc') + '|' + document.readyState + '|' + (b && b.innerText ? b.innerText.length : 0) + '|' + location.href; } catch (e) { return 'err|' + document.readyState + '|0|'; } })()";
+
+// A document with at least this much text is considered settled: it has real
+// content, so a later client-side navigation is an ad/hijack rather than the
+// page still loading.
+const SETTLED_TEXT_CHARS = 400;
+
+// How long a visit waits for the load event (or for content, see
+// CONTENT_POLL_MS) before carrying on with whatever the page has.
+const LOAD_WAIT_MS = 10_000;
+
+// Poll interval of the content-first readiness probe.
+const CONTENT_POLL_MS = 200;
+
+// Wait until the document stops changing.
+//
+// A page that already has content is returned immediately - waiting on it only
+// gives ad scripts time to navigate the tab away (observed on baike.baidu.com,
+// new-akiba.com, oricon.co.jp, whose pages hijack themselves to ad URLs after
+// load). Pages without content (a JS/meta-refresh stub, a mid-reload document
+// with no body) are polled until the URL stops changing, which is what makes
+// client-side redirects work (e.g. the livedoor stub, jin115's reload).
+//
+// Best-effort: a probe that does not look like our marker (e.g. a test fake)
+// counts as settled rather than blocking.
+async function waitForSettledDocument(cdp: CDPLike, timeoutMs = 4000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastHref: string | null = null;
+  while (Date.now() < deadline) {
+    const state = await cdp.evaluate(DOC_STATE_JS);
+    const match = /^(body|nobody|nodoc|err)\|(\w*)\|(\d+)\|(.*)$/.exec(state);
+    if (!match) return;
+    const [, kind, , textLength, href] = match;
+    if (kind === "body" && Number(textLength) >= SETTLED_TEXT_CHARS) return;
+    if (kind === "body" && href === lastHref) return;
+    lastHref = href;
+    await sleep(150);
+  }
+}
+
 // Session logic: navigate, wait, scroll, extract - all against a connected
 // CDP client. Split out from runInPage so it can be tested with a fake
 // CDPLike (no real Chrome, no WebSocket).
@@ -713,6 +777,8 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     interstitialWaitMs = INTERSTITIAL_WAIT_MS,
     interstitialReloadWaitMs = INTERSTITIAL_RELOAD_WAIT_MS,
     resolveGoogleRedirects = false,
+    safetyExtract = false,
+    contentFirst = false,
     onStatus,
   } = opts;
 
@@ -793,9 +859,17 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // themselves once solved - the tab must stay open and alive for that (the
   // old code closed it right away). Anything without challenge markers gets
   // one reload, the F5 move.
+  //
+  // 5xx gateway errors are the same kind of transient: a proxy or upstream
+  // hiccup (a plain http:// page through the proxy answered 502 twice in five
+  // visits while the same URL loaded fine in between) clears on the next
+  // request. A 503 stays on the challenge path below - Cloudflare interstitials
+  // answer 503 and need their wait, not an F5.
   const resolveInterstitial = async (): Promise<void> => {
     const first = latestMainDoc();
-    if (!first || (first.status !== 403 && first.status !== 503)) return;
+    const gatewayError =
+      first !== undefined && first.status >= 500 && first.status < 600 && first.status !== 503;
+    if (!first || (first.status !== 403 && first.status !== 503 && !gatewayError)) return;
 
     // Bot-check JS can be visibility-sensitive. Activate the tab like a user
     // opening the page would, even on paths that normally avoid focus theft.
@@ -805,7 +879,10 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
       // Non-fatal: some targets reject it. The launch flags still help.
     }
 
-    if (first.challenge || (await looksLikeChallengePage(cdp))) {
+    if (
+      first.challenge ||
+      (!gatewayError && (await looksLikeChallengePage(cdp)))
+    ) {
       onStatus(`HTTP ${first.status} - waiting for the site's bot check to clear...`);
       const deadline = Date.now() + interstitialWaitMs;
       while (Date.now() < deadline) {
@@ -820,7 +897,8 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     }
 
     // No challenge markers: treat it as a stale first response (cookie wall,
-    // transient WAF rule, ...) and reload once, like a user pressing F5.
+    // transient WAF rule, proxy hiccup, ...) and reload once, like a user
+    // pressing F5.
     onStatus(`HTTP ${first.status} - retrying once...`);
     const responsesBefore = mainDocCount();
     try {
@@ -842,10 +920,34 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     cdp.onEvent("Page.loadEventFired", () => resolve());
   });
   let loadTimer!: ReturnType<typeof setTimeout>;
-  const loadTimeout = new Promise<void>((resolve) => { loadTimer = setTimeout(resolve, 10_000); });
+  const loadTimeout = new Promise<void>((resolve) => { loadTimer = setTimeout(resolve, LOAD_WAIT_MS); });
 
   await navigateToPage(cdp, url, loaded, onStatus);
-  await Promise.race([loaded, loadTimeout]);
+
+  // Waiting for the load event is not always worth it: on ad-heavy pages hung
+  // frames and analytics requests keep it from firing for the full timeout
+  // while the text has been rendered for seconds. Proceed as soon as the
+  // document has content. The settle step and the HTTP checks below are
+  // unaffected, and extracting earlier is what keeps an ad/anti-bot script
+  // from navigating the tab out from under the extraction.
+  let loadRaceDone = false;
+  const racers: Array<Promise<void>> = [loaded, loadTimeout];
+  if (contentFirst) {
+    const contentReady = (async () => {
+      const deadline = Date.now() + LOAD_WAIT_MS;
+      while (!loadRaceDone && Date.now() < deadline) {
+        const state = String(await cdp.evaluate(DOC_STATE_JS));
+        const m = /^(body|nobody|nodoc|err)\|(\w*)\|(\d+)\|/.exec(state);
+        if (!m) return;
+        if (m[1] === "body" && Number(m[3]) >= SETTLED_TEXT_CHARS) return;
+        await sleep(CONTENT_POLL_MS);
+      }
+    })();
+    contentReady.catch(() => {});
+    racers.push(contentReady);
+  }
+  await Promise.race(racers);
+  loadRaceDone = true;
   clearTimeout(loadTimer);
 
   // A 403/503 from the first response is not final: it is usually a bot-check
@@ -870,6 +972,69 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     onStatus(`HTTP ${text}`);
     return `__HTTP_ERROR__: ${text}`;
   }
+
+  // Client-side redirects (location.replace, meta refresh, document.write
+  // reloads) replace the document after the load event. Extracting during
+  // that window captures the redirect stub - or throws, because document.body
+  // is still null (observed on jin115.com and baike.baidu.com). Let the
+  // document settle first so the extraction sees the final page.
+  await waitForSettledDocument(cdp);
+
+  // A navigation that never became a document (DNS/proxy/TLS/HTTPS-upgrade
+  // failure) leaves the tab on Chrome's error page. Report that instead of
+  // its empty shell (`chrome-error://chromewebdata/`). These transport
+  // failures are transient when several visits load at once through a proxy -
+  // the same URL loads fine on its own - so re-navigate once before giving up.
+  // The retry skips navigateToPage's 3x15s ladder: the first attempt already
+  // spent that, and a retry that hangs is another dead page.
+  let settledHref = String(await cdp.evaluate("location.href"));
+  if (settledHref.startsWith("chrome-error://")) {
+    onStatus("Navigation failed - retrying once...");
+    const retryLoaded = new Promise<void>((resolve) => {
+      cdp.onEvent("Page.loadEventFired", () => resolve());
+    });
+    let retryTimer!: ReturnType<typeof setTimeout>;
+    const retryTimeout = new Promise<void>((resolve) => { retryTimer = setTimeout(resolve, LOAD_WAIT_MS); });
+    try {
+      await cdp.call("Page.navigate", { url }, NAVIGATE_TIMEOUT_MS);
+    } catch {
+      // Leave the tab to whatever it is doing and report below.
+    }
+    await Promise.race([retryLoaded, retryTimeout]);
+    clearTimeout(retryTimer);
+    await waitForSettledDocument(cdp);
+    settledHref = String(await cdp.evaluate("location.href"));
+    if (settledHref.startsWith("chrome-error://")) {
+      return `__NAV_ERROR__: ${url}`;
+    }
+  }
+
+  // Safety extraction, taken before the waits and scrolling below. Ad and
+  // anti-bot scripts on legacy sites navigate the tab away a few seconds after
+  // load (observed on hmv.co.jp, oricon.co.jp, koenote.info, baike.baidu.com).
+  // By the time the second extraction runs it would read the ad page or
+  // Chrome's error page instead. The first pass is cheap, and the second,
+  // post-scroll pass below is the one that catches lazy-loaded content.
+  const originOf = (target: string): string => {
+    try {
+      return new URL(target).origin;
+    } catch {
+      return target;
+    }
+  };
+  // Where the site itself put us: mirror domains (hibari.5ch.net ->
+  // kako.5ch.io) and JS redirects are a normal part of loading a page, and
+  // only a move away from this is a hijack.
+  const settledOrigin = originOf(settledHref);
+  const safety = safetyExtract ? await cdp.evaluate(js) : "";
+  const leftSettledPage = async (): Promise<boolean> => {
+    try {
+      return originOf(String(await cdp.evaluate("location.href"))) !== settledOrigin;
+    } catch {
+      // The tab is gone: something took it, so the safety copy is the page.
+      return true;
+    }
+  };
 
   // Make this the active tab before any scrolling. Tool tabs open in the
   // background. Chrome suspends rendering for non-active tabs, so
@@ -935,6 +1100,17 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   onStatus("Extracting content...");
   let result = await cdp.evaluate(js);
 
+  // If the page was replaced while we waited and scrolled, the extraction
+  // above may have read an ad page, a redirect stub, or a page still showing
+  // its loading skeleton. Keep whichever copy has more text: the safety pass
+  // caught the page early, the second pass caught it late.
+  if (safety.trim().length >= 50 && !safety.startsWith("__") && (await leftSettledPage())) {
+    if (result.trim().length < safety.trim().length) {
+      onStatus("Page navigated away - keeping the pre-scroll extraction...");
+      result = safety;
+    }
+  }
+
   // Fallback: if the primary extractor returned an error marker or nothing
   // useful, run the fallback JS in the same tab (no re-navigation).
   if (opts.fallbackJs && (result.startsWith("__DEFUDDLE_ERROR__") || result.trim().length < 50)) {
@@ -983,6 +1159,11 @@ export interface SearchResult {
   // layer can surface it as an error instead of extracting the error page.
   httpStatus?: number;
   httpStatusText?: string;
+  // Set (with an empty `markdown`) when the navigation itself failed - DNS,
+  // proxy, TLS, or an HTTP->HTTPS upgrade to a host without HTTPS. The tab
+  // sits on Chrome's error page (chrome-error://chromewebdata/), which has no
+  // content to extract.
+  navError?: string;
 }
 
 export interface VisitPageOptions {
@@ -1017,6 +1198,8 @@ async function extractVia(
     initialWaitMs?: number;
     fallbackJs?: string;
     bringToFront?: boolean;
+    safetyExtract?: boolean;
+    contentFirst?: boolean;
     // Resolve Google `/goto` redirect links in the open tab before returning
     // (see src/google-links.ts). Used by googleSearch.
     resolveGoogleRedirects?: boolean;
@@ -1033,6 +1216,8 @@ async function extractVia(
     waitForTimeoutMs: opts.waitForTimeoutMs ?? 10_000,
     fallbackJs: opts.fallbackJs,
     bringToFront: opts.bringToFront ?? false,
+    safetyExtract: opts.safetyExtract ?? false,
+    contentFirst: opts.contentFirst ?? false,
     resolveGoogleRedirects: opts.resolveGoogleRedirects ?? false,
     onStatus: status,
   });
@@ -1046,7 +1231,7 @@ async function extractVia(
 // so results are already unfiltered. Sending `safe=off` anyway keeps them that
 // way per request: it overrides a Filter/Blur choice saved in the profile, and
 // it asks for the "show everything" behaviour where Google's blur-by-default
-// for signed-out users would otherwise apply. If SafeSearch is *locked* (parental
+// for signed-out users would otherwise apply. If SafeSearch is locked (parental
 // controls, school/work network) Google ignores the parameter - nothing a
 // parameter can do about that.
 export function googleSearchUrl(query: string, opts?: { images?: boolean }): string {
@@ -1110,6 +1295,10 @@ function resolveHttpError(markdown: string, url: string): SearchResult {
       httpStatusText: httpErr[2].trim(),
     };
   }
+  const navErr = markdown.match(/^__NAV_ERROR__: (\S*)$/);
+  if (navErr) {
+    return { markdown: "", url: navErr[1] || url, navError: "navigation failed" };
+  }
   return { markdown, url };
 }
 
@@ -1163,11 +1352,11 @@ export async function visitPage(
     }
     return extractVia(url, status, "Using Defuddle for clean article extraction...",
       bundle + "\n;" + DEFUDDLE_DRIVER_JS,
-      { clickConsent: true, fallbackJs: EXTRACT_PAGE_JS });
+      { clickConsent: true, fallbackJs: EXTRACT_PAGE_JS, safetyExtract: true, contentFirst: true });
   }
 
   return extractVia(url, status, "", EXTRACT_PAGE_JS,
-    { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true });
+    { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true, safetyExtract: true, contentFirst: true });
 }
 
 export async function shutdownChrome(): Promise<void> {

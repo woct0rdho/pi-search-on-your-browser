@@ -264,6 +264,25 @@ function visitPageToolDefinition() {
       }
       const fetchElapsed = ((Date.now() - started) / 1000).toFixed(1);
 
+      // Navigation failed (DNS/proxy/TLS/HTTPS-upgrade): the tab never got a
+      // document (Chrome's error page). Report it instead of an empty page so
+      // the model can try another URL or check the network.
+      if (result.navError) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Navigation failed for ${result.url} - the browser could not load the page ` +
+                `(DNS, proxy, TLS, or the site redirected the tab to an error page). ` +
+                `The URL may be unreachable from this network, or the page may have moved.`,
+            },
+          ],
+          details: { url: result.url, elapsed: `${fetchElapsed}s`, navError: result.navError },
+          isError: true,
+        };
+      }
+
       // HTTP error (4xx/5xx) -> surface as an error result
       // The server returned an error status (e.g. 404 on a dead link). Return
       // isError so the LLM knows the URL didn't work and can try another -
