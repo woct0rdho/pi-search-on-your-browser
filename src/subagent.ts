@@ -3,8 +3,7 @@
 // A model is resolved from Pi's registry and called through Pi's
 // provider-neutral stream API with Pi's already-configured auth (no separate
 // API keys). By default the subagent reuses the current session model
-// (ctx.model); an explicit provider/model can be pinned via /browse to use a
-// cheaper/faster model. This module owns the config, the summary prompt, and
+// (ctx.model). This module owns the config, the summary prompt, and
 // context truncation - the model call itself lives in index.ts, next to the
 // registry.
 //
@@ -16,10 +15,11 @@
 // type-checkable under `tsc --noEmit` (which only resolves Node built-ins for
 // src/).
 //
-// Config is persisted to <agent-dir>/search-on-your-browser.json (set via
-// setConfigDir(getAgentDir()) on session_start) and managed via /browse.
+// Config is read from <agent-dir>/search-on-your-browser.json (set via
+// setConfigDir(getAgentDir()) on session_start). The file is edited by hand and
+// is optional - missing keys fall back to the env vars below, then defaults.
 //
-// Env-var fallbacks (optional overrides; else current model is used):
+// Env-var fallbacks (optional overrides, else current model is used):
 // PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, PI_BROWSE_MAX_TOKENS,
 // PI_BROWSE_REASONING_EFFORT, PI_BROWSE_SUMMARY_ENABLED,
 // PI_BROWSE_CLEAN_ENABLED.
@@ -27,13 +27,13 @@
 // `summaryEnabled` and `cleanEnabled` select whether `visit_page` offers its
 // `summary` / `clean` options at all (they never disable the tool itself).
 //
-// The same file also configures the browser itself (proxy), written as
-// `"browser": { "proxy": "http://127.0.0.1:8010" }`; PI_SEARCH_PROXY overrides
+// The same file also configures the browser itself (proxy), set as
+// `"browser": { "proxy": "http://127.0.0.1:8010" }`. PI_SEARCH_PROXY overrides
 // it when the file does not set one.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 // Reasoning effort levels
 const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
@@ -48,14 +48,13 @@ export interface SubagentConfig {
   // Whether `visit_page` offers `summary` mode. When false the option is
   // hidden from the model completely - no `summary` parameter and no mention
   // of it in the tool description, snippet, or guidelines - and pages are
-  // returned as raw markdown. It does not disable the tool itself. Toggled
-  // with /browse on|off.
+  // returned as raw markdown. It does not disable the tool itself.
   summaryEnabled: boolean;
   // Whether `visit_page` offers `clean` mode (the Defuddle reader-mode
   // extraction). When false the option is hidden from the model completely -
   // no `clean` parameter and no mention of it (or of combining it with
   // `summary`) anywhere in the tool surface. It does not disable the tool
-  // itself. Toggled with /browse clean on|off.
+  // itself.
   cleanEnabled: boolean;
   // Chrome `--proxy-server` value (e.g. "http://127.0.0.1:8010"). Empty
   // string means a direct connection. Passed to Chrome at launch, so a
@@ -74,7 +73,7 @@ const DEFAULT_CONFIG: SubagentConfig = {
   proxy: "",
 };
 
-// Live config singleton. Mutated in place by /browse and session_start.
+// Live config singleton.
 export const config: SubagentConfig = { ...DEFAULT_CONFIG };
 
 // Config file path. Overridden by index.ts via setConfigDir(getAgentDir()) so
@@ -157,7 +156,7 @@ export function normalizeProxy(value: unknown): string | undefined {
   const raw = value.trim();
   if (!raw) return undefined;
   if (["off", "none", "direct", "false", "0"].includes(raw.toLowerCase())) return undefined;
-  // Bare host:port has no scheme; default to HTTP like Chrome does.
+  // Bare host:port has no scheme. Default to HTTP like Chrome does.
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`;
   try {
     const url = new URL(withScheme);
@@ -177,10 +176,10 @@ export function validateReasoningLevel(value: string | undefined): ReasoningLeve
   return undefined;
 }
 
-// Config persistence
+// Config loading
 
 // Load config from the JSON file. Returns null if missing or unparseable.
-export function loadConfigFile(): RawConfig | null {
+function loadConfigFile(): RawConfig | null {
   try {
     const path = configPath();
     if (!existsSync(path)) return null;
@@ -192,33 +191,12 @@ export function loadConfigFile(): RawConfig | null {
   }
 }
 
-// Save current config to the JSON file. Browser launch settings live under a
-// `browser` object so the file stays readable.
-export function saveConfigFile(): void {
-  try {
-    const path = configPath();
-    mkdirSync(dirname(path), { recursive: true });
-    const out = {
-      provider: config.provider,
-      model: config.model,
-      maxTokens: config.maxTokens,
-      defaultReasoningEffort: config.defaultReasoningEffort,
-      summaryEnabled: config.summaryEnabled,
-      cleanEnabled: config.cleanEnabled,
-      browser: { proxy: config.proxy },
-    };
-    writeFileSync(path, JSON.stringify(out, null, 2) + "\n");
-  } catch {
-    // best effort - directory not writable, etc.
-  }
-}
-
 // Resolve config with priority:
 //   1. Config file (<agent-dir>/search-on-your-browser.json)
 //   2. Environment variables (PI_BROWSE_PROVIDER, PI_BROWSE_MODEL, etc.)
 //   3. Built-in defaults
 //
-// The file wins over env vars so /browse config changes are sticky.
+// The file wins over env vars.
 export function resolveConfig(): SubagentConfig {
   const file = loadConfigFile();
   const envReasoning = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT);
@@ -227,8 +205,8 @@ export function resolveConfig(): SubagentConfig {
   const envSummaryEnabled = asEnvBool(process.env.PI_BROWSE_SUMMARY_ENABLED);
   const fileCleanEnabled = asBool(file?.cleanEnabled);
   const envCleanEnabled = asEnvBool(process.env.PI_BROWSE_CLEAN_ENABLED);
-  // Browser settings may live under `browser` (documented shape, what
-  // saveConfigFile writes) or at the top level (hand-written convenience).
+  // Browser settings may live under `browser` (the documented shape) or at the
+  // top level (hand-written convenience).
   const fileBrowser =
     file && typeof file.browser === "object" && file.browser !== null
       ? (file.browser as RawConfig)
@@ -254,69 +232,6 @@ export function resolveConfig(): SubagentConfig {
 // Reload config from file/env into the live singleton.
 export function reloadConfig(): void {
   Object.assign(config, resolveConfig());
-}
-
-// Human-readable config summary for the /browse command.
-//
-// `currentModel` (the active session model, from ctx.model) is shown so the
-// user knows what summary mode will use when no explicit provider/model is
-// configured - by default the subagent reuses the current Pi model and its
-// already-configured auth, so no separate API key setup is needed.
-export function configSummary(
-  currentModel?: { provider: string; id: string; name?: string },
-): string {
-  const file = loadConfigFile();
-  const src = file
-    ? "config file"
-    : process.env.PI_BROWSE_PROVIDER
-      ? "env vars"
-      : "default (current model)";
-  const override = config.provider && config.model;
-  const modelLine = override
-    ? `${config.provider}/${config.model}`
-    : currentModel
-      ? `${currentModel.provider}/${currentModel.id} (current model)`
-      : "(none - no current model)";
-  return [
-    `Browse subagent configuration (source: ${src})`,
-    `  Model:             ${modelLine}`,
-    `  Max tokens:        ${config.maxTokens}`,
-    `  Reasoning effort:  ${config.defaultReasoningEffort}`,
-    `  Summary mode:      ${config.summaryEnabled ? "enabled (visit_page offers `summary: true`)" : "disabled (visit_page returns raw pages, no summary option shown)"}`,
-    `  Clean mode:        ${config.cleanEnabled ? "enabled (visit_page offers `clean: true`)" : "disabled (visit_page always uses the default extractor)"}`,
-    `  Chrome proxy:      ${config.proxy || "(direct, no proxy)"}`,
-    ``,
-    `Config file: ${configPath()}`,
-    ``,
-    ...(config.summaryEnabled
-      ? [
-          "When visit_page is called with `summary: true`, the page content is sent to this",
-          "model and only its concise summary is returned to the chat context (the full",
-          "page markdown is discarded). Without `summary`, visit_page returns the raw page.",
-        ]
-      : [
-          "Summary mode is disabled: visit_page does not offer `summary` at all - the option",
-          "is hidden from the model and pages are always returned as raw markdown. The model",
-          "settings above are kept for when you re-enable it with /browse on.",
-        ]),
-    ...(config.cleanEnabled
-      ? []
-      : [
-          "",
-          "Clean mode is disabled: visit_page does not offer `clean` at all - the option is",
-          "hidden from the model and the default block-walker extractor is always used.",
-          "Re-enable it with /browse clean on.",
-        ]),
-    ``,
-    "By default the subagent reuses your current Pi model (shown above) with its",
-    "already-configured auth - no API keys to set up. To pin a different model:",
-    "  /browse provider <provider>   /browse model <model-id>",
-    "Other settings: max-tokens, reasoning-effort, proxy. Summary mode: /browse on|off.",
-    "Clean mode: /browse clean on|off.",
-    "",
-    "The Chrome proxy is applied when Chrome is launched; changing it restarts the",
-    "tool's Chrome on the next google_search / visit_page call.",
-  ].join("\n");
 }
 
 // Token budget / truncation

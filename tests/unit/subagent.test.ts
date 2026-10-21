@@ -1,18 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   validateReasoningLevel,
   truncateForContext,
   buildSummaryPrompt,
-  configSummary,
-  config as __config,
   normalizeProxy,
-  reloadConfig,
   resolveConfig,
-  saveConfigFile,
   setConfigDir,
   configPath,
 } from "../../src/subagent.ts";
@@ -97,42 +93,6 @@ test("buildSummaryPrompt: content is wrapped between delimiters", () => {
   assert.ok(prompt.slice(before + 4, after).includes("BODY"), "content not between delimiters");
 });
 
-// configSummary: current-model fallback
-// The key behavior change in v0.7: when no provider/model is pinned, the
-// subagent reuses the current session model - configSummary should make that
-// visible instead of showing "(not set)".
-
-test("configSummary: shows current model when no override is configured", () => {
-  __config.provider = undefined;
-  __config.model = undefined;
-  reloadConfig();
-  const summary = configSummary({ provider: "openai", id: "gpt-4o", name: "GPT-4o" });
-  assert.ok(summary.includes("openai/gpt-4o"), "should show current model");
-  assert.ok(summary.includes("current model"), "should label it as the current model");
-  assert.ok(!summary.includes("(not set)"), "should not say not-set when a current model exists");
-});
-
-test("configSummary: shows pinned override when provider+model are configured", () => {
-  __config.provider = "anthropic";
-  __config.model = "claude-3-5-haiku";
-  const summary = configSummary({ provider: "openai", id: "gpt-4o" });
-  // The Model line should show the override, not the current model.
-  const modelLine = summary.split("\n").find((l) => l.includes("Model:"));
-  assert.ok(modelLine?.includes("anthropic/claude-3-5-haiku"), `model line should show override: ${modelLine}`);
-  assert.ok(!modelLine?.includes("current model"), "override should not be labeled current");
-  // cleanup
-  __config.provider = undefined;
-  __config.model = undefined;
-});
-
-test("configSummary: shows (none) when no override and no current model", () => {
-  __config.provider = undefined;
-  __config.model = undefined;
-  reloadConfig();
-  const summary = configSummary(undefined);
-  assert.ok(summary.includes("(none"), "should indicate no model available");
-});
-
 // Chrome proxy configuration
 // The proxy is handed to Chrome as --proxy-server when the browser is
 // launched (see chrome.ts), so on machines that need a proxy to reach the
@@ -203,7 +163,7 @@ test("resolveConfig: accepts a top-level proxy and lets the file win over the en
     );
     process.env.PI_SEARCH_PROXY = "http://env-proxy:3128";
     assert.equal(resolveConfig().proxy, "socks5://127.0.0.1:1080",
-      "the config file should win (so /browse changes are sticky)");
+      "the config file should win");
   });
 });
 
@@ -231,47 +191,11 @@ test("resolveConfig: tolerates a malformed config file and an invalid proxy", ()
   });
 });
 
-test("saveConfigFile: persists the proxy under browser.proxy", () => {
-  withTempConfigDir((dir) => {
-    const savedProxy = __config.proxy;
-    const savedSummary = __config.summaryEnabled;
-    try {
-      __config.proxy = "http://127.0.0.1:8010";
-      __config.summaryEnabled = true;
-      saveConfigFile();
-      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
-      assert.equal(raw.browser.proxy, "http://127.0.0.1:8010");
-      // Round-trip: what was written is what resolveConfig reads back.
-      assert.equal(resolveConfig().proxy, "http://127.0.0.1:8010");
-    } finally {
-      __config.proxy = savedProxy;
-      __config.summaryEnabled = savedSummary;
-    }
-  });
-});
-
-test("configSummary: shows the effective Chrome proxy", () => {
-  const saved = __config.proxy;
-  try {
-    __config.proxy = "http://127.0.0.1:8010";
-    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
-    const line = summary.split("\n").find((l) => l.includes("Chrome proxy:"));
-    assert.ok(line?.includes("http://127.0.0.1:8010"), `proxy line should show the value: ${line}`);
-
-    __config.proxy = "";
-    const direct = configSummary({ provider: "openai", id: "gpt-4o" });
-    const directLine = direct.split("\n").find((l) => l.includes("Chrome proxy:"));
-    assert.ok(directLine?.includes("direct"), `proxy line should say direct: ${directLine}`);
-  } finally {
-    __config.proxy = saved;
-  }
-});
-
 // summary-mode configuration (`summaryEnabled`)
 // `summaryEnabled: false` does not disable visit_page - ``url``/``clean`` keep
 // working - it is what makes index.ts hide the `summary` option from the model
 // entirely (no parameter, no description/guideline mention). These tests pin
-// down how the flag is read and what /browse reports.
+// down how the flag is read.
 
 test("resolveConfig: summary mode defaults to enabled", () => {
   withTempConfigDir(() => {
@@ -311,46 +235,6 @@ test("resolveConfig: the config file wins over PI_BROWSE_SUMMARY_ENABLED", () =>
     process.env.PI_BROWSE_SUMMARY_ENABLED = "1";
     assert.equal(resolveConfig().summaryEnabled, false, "the file should win over the env var");
   });
-});
-
-test("saveConfigFile: round-trips summaryEnabled = false", () => {
-  withTempConfigDir((dir) => {
-    const saved = __config.summaryEnabled;
-    try {
-      __config.summaryEnabled = false;
-      saveConfigFile();
-      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
-      assert.equal(raw.summaryEnabled, false);
-      assert.equal(resolveConfig().summaryEnabled, false);
-    } finally {
-      __config.summaryEnabled = saved;
-    }
-  });
-});
-
-test("configSummary: reports summary mode as enabled by default", () => {
-  const saved = __config.summaryEnabled;
-  try {
-    __config.summaryEnabled = true;
-    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
-    const line = summary.split("\n").find((l) => l.includes("Summary mode:"));
-    assert.ok(line?.includes("enabled"), `summary-mode line should say enabled: ${line}`);
-  } finally {
-    __config.summaryEnabled = saved;
-  }
-});
-
-test("configSummary: reports the hidden summary option when disabled", () => {
-  const saved = __config.summaryEnabled;
-  try {
-    __config.summaryEnabled = false;
-    const summary = configSummary({ provider: "openai", id: "gpt-4o" });
-    const line = summary.split("\n").find((l) => l.includes("Summary mode:"));
-    assert.ok(line?.includes("disabled"), `summary-mode line should say disabled: ${line}`);
-    assert.ok(/hidden from the model/i.test(summary), "should explain that the option is hidden");
-  } finally {
-    __config.summaryEnabled = saved;
-  }
 });
 
 // clean-mode configuration (`cleanEnabled`)
@@ -414,37 +298,4 @@ test("resolveConfig: the config file wins over PI_BROWSE_CLEAN_ENABLED", () => {
     process.env.PI_BROWSE_CLEAN_ENABLED = "1";
     assert.equal(resolveConfig().cleanEnabled, false, "the file should win over the env var");
   });
-});
-
-test("saveConfigFile: round-trips cleanEnabled = false", () => {
-  withTempConfigDir((dir) => {
-    const saved = __config.cleanEnabled;
-    try {
-      __config.cleanEnabled = false;
-      saveConfigFile();
-      const raw = JSON.parse(readFileSync(join(dir, "search-on-your-browser.json"), "utf-8"));
-      assert.equal(raw.cleanEnabled, false);
-      assert.equal(resolveConfig().cleanEnabled, false);
-    } finally {
-      __config.cleanEnabled = saved;
-    }
-  });
-});
-
-test("configSummary: reports clean mode on or off", () => {
-  const saved = __config.cleanEnabled;
-  try {
-    __config.cleanEnabled = true;
-    const on = configSummary({ provider: "openai", id: "gpt-4o" });
-    const onLine = on.split("\n").find((l) => l.includes("Clean mode:"));
-    assert.ok(onLine?.includes("enabled"), `clean-mode line should say enabled: ${onLine}`);
-
-    __config.cleanEnabled = false;
-    const off = configSummary({ provider: "openai", id: "gpt-4o" });
-    const offLine = off.split("\n").find((l) => l.includes("Clean mode:"));
-    assert.ok(offLine?.includes("disabled"), `clean-mode line should say disabled: ${offLine}`);
-    assert.ok(/\/browse clean on/.test(off), "should point at /browse clean on");
-  } finally {
-    __config.cleanEnabled = saved;
-  }
 });

@@ -10,7 +10,7 @@ import {
 // visitPageSurface() + visitPageParameters() build the agent-facing surface of
 // visit_page from the two config flags. The core invariant: a disabled feature
 // must be invisible to the model - no parameter, no description/guideline
-// mention, no /browse hint - while the rest of the surface stays identical.
+// mention - while the rest of the surface stays identical.
 // stripDisabledArguments covers stale arguments.
 
 const COMBOS: VisitPageOptions[] = [
@@ -48,17 +48,6 @@ test("each feature is mentioned iff its flag is enabled", () => {
       options.cleanEnabled,
       `[${label(options)}] clean mention should match cleanEnabled`,
     );
-  }
-});
-
-test("disabled features are never hinted at via /browse", () => {
-  // /browse is only mentioned in the summary strings; those must be absent
-  // when summary mode is off (and the plain base never mentions it).
-  for (const options of COMBOS) {
-    const text = allStrings(options).join("\n");
-    if (!options.summaryEnabled) {
-      assert.ok(!/\/browse/.test(text), `[${label(options)}] no /browse hint`);
-    }
   }
 });
 

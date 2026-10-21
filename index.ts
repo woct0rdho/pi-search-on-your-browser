@@ -24,25 +24,20 @@
 //
 //                       Optional `summary` parameter: when `true`, the full page content is read
 //                       by a configurable subagent model and only a concise summary is returned -
-//                       the raw page markdown never enters the chat context. Configure the subagent
-//                       with /browse. (Mirrors the vision-tool extension's subagent pattern.)
+//                       the raw page markdown never enters the chat context.
 //
 //                       When summary mode is disabled - `"summaryEnabled": false` in the config
-//                       file, `PI_BROWSE_SUMMARY_ENABLED=0`, or `/browse off` - the `summary`
+//                       file, or `PI_BROWSE_SUMMARY_ENABLED=0` - the `summary`
 //                       parameter is removed from the tool schema and the description, prompt
 //                       snippet, and guidelines are swapped for variants that never mention it,
 //                       so the model is not told the option exists.
 //
 //                       `clean` is gated independently by `cleanEnabled`: `"cleanEnabled": false`
-//                       in the config file, `PI_BROWSE_CLEAN_ENABLED=0`, or `/browse clean off`
+//                       in the config file, or `PI_BROWSE_CLEAN_ENABLED=0`
 //                       removes the `clean` parameter and every mention of it, including the
 //                       "Combine with `clean: true`" sentence in the summary parameter
 //                       description. Disabling one feature never affects the other, or the rest
 //                       of the tool (`url` and google_search always work).
-//
-// Registered commands:
-//   - /browse             - Configure the visit_page subagent (provider, model, etc.)
-//   - /google-search-kill - Kill the Chrome process
 //
 // Chrome runs in a visible window (not headless) with a dedicated profile at
 // ~/.pi-search-browser/ - cookies and sessions persist across calls.
@@ -56,19 +51,14 @@ import {
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { googleSearch, googleImageSearch, reverseImageSearch, visitPage, shutdownChrome, type SearchResult } from "./src/chrome.js";
+import { googleSearch, googleImageSearch, reverseImageSearch, visitPage, type SearchResult } from "./src/chrome.js";
 import {
   config,
   reloadConfig,
-  saveConfigFile,
-  configSummary,
-  validateReasoningLevel,
   setConfigDir,
   truncateForContext,
   buildSummaryPrompt,
   SUBAGENT_SYSTEM_PROMPT,
-  normalizeProxy,
-  type SubagentConfig,
 } from "./src/subagent.js";
 import {
   visitPageSurface,
@@ -145,8 +135,7 @@ function updateStatus(ctx: {
 // enabled its parameter is required, and when disabled it is hidden from the
 // model completely - omitted from the schema and never mentioned in the
 // description, prompt snippet, or guidelines. Registered by syncVisitPageTool()
-// in the factory and re-registered on /browse on|off and /browse clean on|off,
-// so a config change applies to the next turn.
+// in the factory, so a config change applies to the next turn.
 function visitPageToolDefinition() {
   const summaryEnabled = config.summaryEnabled;
   const cleanEnabled = config.cleanEnabled;
@@ -202,8 +191,7 @@ function visitPageToolDefinition() {
       if (summarize) {
         // By default the subagent reuses the current session model (ctx.model)
         // - no provider/model config or API keys needed, since Pi already has
-        // them. An explicit /browse override takes precedence when both
-        // provider and model are set.
+        // them.
         if (config.provider && config.model) {
           subModel = ctx.modelRegistry.find(config.provider, config.model);
           if (!subModel) {
@@ -214,8 +202,7 @@ function visitPageToolDefinition() {
                   text: [
                     `Browse subagent error: model "${config.provider}/${config.model}" not found in the model registry.`,
                     "",
-                    "Make sure the provider and model are defined in ~/.pi/agent/models.json,",
-                    "or run /browse clear to fall back to the current session model.",
+                    "Make sure the provider and model are defined in ~/.pi/agent/models.json .",
                   ].join("\n"),
                 },
               ],
@@ -230,7 +217,7 @@ function visitPageToolDefinition() {
               content: [
                 {
                   type: "text" as const,
-                  text: "Browse subagent error: no model is active in this session. Start a session with a model first, or set one with /browse provider and /browse model.",
+                  text: "Browse subagent error: no model is active in this session. Start a session with a model first.",
                 },
               ],
               details: { url: targetUrl, summarized: true, error: "no_current_model" },
@@ -244,7 +231,7 @@ function visitPageToolDefinition() {
             content: [
               {
                 type: "text" as const,
-                text: `Browse subagent error: no credentials configured for provider "${subModel.provider}". Run /login for it, or pin another model with /browse provider and /browse model.`,
+                text: `Browse subagent error: no credentials configured for provider "${subModel.provider}". Run /login for it.`,
               },
             ],
             details: { url: targetUrl, summarized: true, error: "auth_error" },
@@ -341,7 +328,7 @@ function visitPageToolDefinition() {
         } else if (code === 403) {
           const isChallenge = /challenge|bot|captcha|cloudflare|datadome|perimeterx|incapsula/i.test(reason);
           hint = isChallenge
-            ? "The site served a bot check that did not clear automatically. The tool's Chrome window is visible - open or refresh this URL there (click the check if one appears), then retry; the clearance is stored in the browser profile."
+            ? "The site served a bot check that did not clear automatically. The tool's Chrome window is visible - open or refresh this URL there (click the check if one appears), then retry. The clearance is stored in the browser profile."
             : "Access was denied - the site may be blocking automated access, require authentication, or be behind a paywall. The tool's Chrome window is visible: open this URL there to log in or clear any check, then retry.";
         } else if (code === 429) {
           hint = "Rate limited - too many requests. Wait a moment and retry.";
@@ -576,302 +563,18 @@ function visitPageToolDefinition() {
 export default function searchOnYourBrowser(pi: ExtensionAPI) {
   // Load config before first use
   // The visit_page tool surface depends on `summaryEnabled` (summary offered
-  // vs hidden), so the config file is read before the tool is registered - not
-  // just on session_start, where session-entry overrides are also restored.
+  // vs hidden), so the config file is read before the tool is registered, not
+  // just on session_start.
   setConfigDir(getAgentDir());
   reloadConfig();
 
-  // Session lifecycle: load & persist config
-
+  // Re-read the config file for each session so edits made while Pi is running
+  // apply on the next session, and re-register visit_page for the new surface.
   pi.on("session_start", async (_event, ctx) => {
     setConfigDir(getAgentDir());
     reloadConfig();
-
-    // Restore mid-session config changes from this branch's session entries
-    // (belt-and-suspenders alongside the config file). Uses getBranch(), not
-    // getEntries(): abandoned branches are alternative histories and must not
-    // leak their config into the current branch.
-    const entries = ctx.sessionManager.getBranch();
-    for (const entry of entries) {
-      if (entry.type === "custom" && entry.customType === "browse-config") {
-        const data = entry.data as Partial<SubagentConfig> | undefined;
-        if (!data) continue;
-        if (data.provider !== undefined) config.provider = data.provider || undefined;
-        if (data.model !== undefined) config.model = data.model || undefined;
-        if (data.maxTokens !== undefined) config.maxTokens = data.maxTokens;
-        if (data.defaultReasoningEffort !== undefined) config.defaultReasoningEffort = data.defaultReasoningEffort;
-        if (data.summaryEnabled !== undefined) config.summaryEnabled = data.summaryEnabled;
-        if (data.cleanEnabled !== undefined) config.cleanEnabled = data.cleanEnabled;
-        if (data.proxy !== undefined) config.proxy = data.proxy;
-      }
-    }
-
     syncVisitPageTool();
     updateStatus(ctx);
-  });
-
-  // Persist current config into the session file (in addition to the file).
-  function persistConfig() {
-    pi.appendEntry("browse-config", { ...config });
-  }
-
-  // Apply a /browse proxy argument: a URL, or "off"/"none"/"direct" to
-  // connect directly. Chrome picks the value up when it is (re)launched, so
-  // the next tool call restarts it automatically when the value changed.
-  function applyProxyArgument(value: string): { ok: boolean; message: string } {
-    const cleared = ["off", "none", "direct", "false", "0"].includes(value.toLowerCase());
-    const proxy = cleared ? "" : normalizeProxy(value);
-    if (proxy === undefined) {
-      return {
-        ok: false,
-        message:
-          `Invalid proxy: "${value}". Use a URL like http://127.0.0.1:8010 ` +
-          `(or socks5://host:port), or "off" to connect directly.`,
-      };
-    }
-    config.proxy = proxy;
-    saveConfigFile();
-    persistConfig();
-    return {
-      ok: true,
-      message: proxy
-        ? `Chrome proxy set to "${proxy}". Chrome restarts with the new proxy on the next google_search / visit_page call.`
-        : "Chrome proxy cleared - Chrome will connect directly on the next call.",
-    };
-  }
-
-  // /browse command
-
-  pi.registerCommand("browse", {
-    description: "visit_page subagent settings (config, show, clear, on, off)",
-    handler: async (args, ctx) => {
-      const trimmed = args?.trim() ?? "";
-
-      if (!trimmed) {
-        ctx.ui.notify(configSummary(ctx.model), "info");
-        return;
-      }
-
-      if (trimmed === "on") {
-        config.summaryEnabled = true;
-        saveConfigFile();
-        persistConfig();
-        syncVisitPageTool();
-        updateStatus(ctx);
-        ctx.ui.notify(
-          "Summary mode enabled - visit_page now offers `summary: true` to the model. " +
-            "The subagent reuses the current session model by default (no footer indicator); " +
-            "pin a different one with /browse provider + /browse model.",
-          "info",
-        );
-        return;
-      }
-
-      if (trimmed === "off") {
-        config.summaryEnabled = false;
-        saveConfigFile();
-        persistConfig();
-        syncVisitPageTool();
-        updateStatus(ctx);
-        ctx.ui.notify(
-          "Summary mode disabled - visit_page no longer advertises or accepts `summary`; the option is " +
-            "hidden from the model and pages are returned as raw markdown. Re-enable with /browse on.",
-          "info",
-        );
-        return;
-      }
-
-      const parts = trimmed.split(/\s+/);
-      const subcommand = parts[0].toLowerCase();
-      const rest = parts.slice(1).join(" ");
-
-      if (subcommand === "show" || subcommand === "status") {
-        ctx.ui.notify(configSummary(ctx.model), "info");
-        return;
-      }
-
-      // /browse clean on|off - toggle clean mode independently of summary mode
-      if (subcommand === "clean") {
-        const value = rest.trim().toLowerCase();
-        if (!value) {
-          ctx.ui.notify(
-            `Clean mode is currently ${config.cleanEnabled ? "enabled" : "disabled"}. Use /browse clean on|off.`,
-            "info",
-          );
-          return;
-        }
-        if (value !== "on" && value !== "off") {
-          ctx.ui.notify(`Invalid value: "${rest}". Use /browse clean on|off.`, "error");
-          return;
-        }
-        config.cleanEnabled = value === "on";
-        saveConfigFile();
-        persistConfig();
-        syncVisitPageTool();
-        ctx.ui.notify(
-          config.cleanEnabled
-            ? "Clean mode enabled - visit_page now offers `clean: true` to the model."
-            : "Clean mode disabled - visit_page no longer advertises or accepts `clean`; the default extractor is always used.",
-          "info",
-        );
-        return;
-      }
-
-      if (subcommand === "clear" || subcommand === "reset") {
-        config.provider = undefined;
-        config.model = undefined;
-        config.maxTokens = parseInt(process.env.PI_BROWSE_MAX_TOKENS ?? "2048", 10);
-        config.defaultReasoningEffort = validateReasoningLevel(process.env.PI_BROWSE_REASONING_EFFORT) ?? "off";
-        config.summaryEnabled = true;
-        config.proxy = normalizeProxy(process.env.PI_SEARCH_PROXY) ?? "";
-        saveConfigFile();
-        persistConfig();
-        syncVisitPageTool();
-        updateStatus(ctx);
-        ctx.ui.notify("Browse subagent config reset to defaults", "info");
-        return;
-      }
-
-      // /browse config <setting> [value]
-      if (subcommand === "config" || subcommand === "cfg") {
-        const settingParts = rest.split(/\s+/);
-        const setting = settingParts[0]?.toLowerCase();
-        const value = settingParts.slice(1).join(" ");
-
-        if (!setting) {
-          ctx.ui.notify(configSummary(ctx.model), "info");
-          return;
-        }
-
-        if (setting === "provider") {
-          if (!value) {
-            ctx.ui.notify(`Current provider: ${config.provider ?? "(not set)"}`, "info");
-            return;
-          }
-          config.provider = value || undefined;
-          saveConfigFile();
-          persistConfig();
-          updateStatus(ctx);
-          ctx.ui.notify(`Browse subagent provider set to "${config.provider}"`, "info");
-          return;
-        }
-
-        if (setting === "model") {
-          if (!value) {
-            ctx.ui.notify(`Current model: ${config.model ?? "(not set)"}`, "info");
-            return;
-          }
-          config.model = value || undefined;
-          saveConfigFile();
-          persistConfig();
-          updateStatus(ctx);
-          ctx.ui.notify(`Browse subagent model set to "${config.model}"`, "info");
-          return;
-        }
-
-        if (setting === "max-tokens" || setting === "maxtokens" || setting === "max_tokens") {
-          if (!value) {
-            ctx.ui.notify(`Current max tokens: ${config.maxTokens}`, "info");
-            return;
-          }
-          const n = parseInt(value, 10);
-          if (isNaN(n) || n < 1) {
-            ctx.ui.notify(`Invalid max-tokens: "${value}". Must be a positive number.`, "error");
-            return;
-          }
-          config.maxTokens = n;
-          saveConfigFile();
-          persistConfig();
-          ctx.ui.notify(`Browse subagent max tokens set to ${config.maxTokens}`, "info");
-          return;
-        }
-
-        if (setting === "reasoning-effort" || setting === "reasoning" || setting === "thinking") {
-          if (!value) {
-            ctx.ui.notify(`Current reasoning effort: ${config.defaultReasoningEffort}`, "info");
-            return;
-          }
-          const level = validateReasoningLevel(value);
-          if (!level) {
-            ctx.ui.notify(
-              `Invalid reasoning level: "${value}". Use: off, minimal, low, medium, high, xhigh`,
-              "error",
-            );
-            return;
-          }
-          config.defaultReasoningEffort = level;
-          saveConfigFile();
-          persistConfig();
-          ctx.ui.notify(`Browse subagent reasoning effort set to "${config.defaultReasoningEffort}"`, "info");
-          return;
-        }
-
-        if (setting === "proxy") {
-          if (!value) {
-            ctx.ui.notify(
-              `Current Chrome proxy: ${config.proxy || "(direct, no proxy)"}\n\n` +
-                `Set it with: /browse config proxy http://127.0.0.1:8010\n` +
-                `Clear it with: /browse config proxy off\n` +
-                `Also honored: the PI_SEARCH_PROXY environment variable.`,
-              "info",
-            );
-            return;
-          }
-          const applied = applyProxyArgument(value);
-          ctx.ui.notify(applied.message, applied.ok ? "info" : "error");
-          return;
-        }
-
-        ctx.ui.notify(
-          `Unknown config setting: "${setting}". Use: provider, model, max-tokens, reasoning-effort, proxy`,
-          "error",
-        );
-        return;
-      }
-
-      // Shorthand: /browse provider <name> or /browse model <name>
-      if (subcommand === "provider") {
-        if (!rest) {
-          ctx.ui.notify(`Current provider: ${config.provider ?? "(not set)"}`, "info");
-          return;
-        }
-        config.provider = rest || undefined;
-        saveConfigFile();
-        persistConfig();
-        updateStatus(ctx);
-        ctx.ui.notify(`Browse subagent provider set to "${config.provider}"`, "info");
-        return;
-      }
-
-      if (subcommand === "model") {
-        if (!rest) {
-          ctx.ui.notify(`Current model: ${config.model ?? "(not set)"}`, "info");
-          return;
-        }
-        config.model = rest || undefined;
-        saveConfigFile();
-        persistConfig();
-        updateStatus(ctx);
-        ctx.ui.notify(`Browse subagent model set to "${config.model}"`, "info");
-        return;
-      }
-
-      // Shorthand: /browse proxy <url|off>
-      if (subcommand === "proxy") {
-        if (!rest) {
-          ctx.ui.notify(`Current Chrome proxy: ${config.proxy || "(direct, no proxy)"}`, "info");
-          return;
-        }
-        const applied = applyProxyArgument(rest);
-        ctx.ui.notify(applied.message, applied.ok ? "info" : "error");
-        return;
-      }
-
-      ctx.ui.notify(
-        `Unknown subcommand: "${subcommand}". Use: config, show, clear, on, off, clean (or provider/model)`,
-        "error",
-      );
-    },
   });
 
   // google_search tool
@@ -886,7 +589,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       label: "Google Search",
       description:
         "Search Google in your visible Chrome browser and return compact Markdown links. Uses your real browser fingerprint - no API keys, no headless detection.",
-      promptSnippet: "google_search: search Google in your visible browser, returns markdown links",
+      promptSnippet: "google_search: search Google in your visible browser. Returns markdown links",
       promptGuidelines: [
         "Use google_search to find web pages when you need real-time information. Results include clickable markdown links.",
       ],
@@ -970,9 +673,9 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       name: "google_image_search",
       label: "Google Image Search",
       description:
-        "Search Google Images in your visible Chrome browser. Every result gives the image URL and the URL of the page the image was found on, plus the page title and, when known, the image size. The original image URL is resolved through Google's preview panel; when a site blocks hotlinking, Google's cached thumbnail is returned instead (marked google-cached). Uses your real browser fingerprint - no API keys, no headless detection.",
+        "Search Google Images in your visible Chrome browser. Every result gives the image URL and the URL of the page the image was found on, plus the page title and, when known, the image size. The original image URL is resolved through Google's preview panel. When a site blocks hotlinking, Google's cached thumbnail is returned instead (marked google-cached). Uses your real browser fingerprint - no API keys, no headless detection.",
       promptSnippet:
-        "google_image_search: search Google Images in your visible browser; returns each image URL with the page URL it came from",
+        "google_image_search: search Google Images in your visible browser. Returns each image URL with the page URL it came from",
       promptGuidelines: [
         "Use google_image_search when you need pictures, diagrams, charts, or screenshots and want to know where they come from. Each result carries the image URL (original when the site allows hotlinking, otherwise Google's cached thumbnail, marked google-cached) and the page URL the image appears on - visit_page that page when you need the context around the image.",
       ],
@@ -1066,10 +769,10 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       description:
         "Reverse image search: upload a local image file to Google Lens in your visible Chrome browser and return where it appears. `mode: \"exact\"` lists the pages that show the same image; `mode: \"visual\"` lists visually similar images and the pages they appear on. Each result carries the page URL, the source site, and (when available) the matched image URL. Uses your real browser session - no API keys, no headless detection.",
       promptSnippet:
-        "google_search_by_image: upload a local image file to Google Lens; returns the pages showing the same image (exact) or visually similar images (visual)",
+        "google_search_by_image: upload a local image file to Google Lens. Returns the pages showing the same image (exact) or visually similar images (visual)",
       promptGuidelines: [
         "Use google_search_by_image when you have a local image file (a screenshot, a downloaded picture) and need its source or lookalikes. Pass the path exactly as you would to the read tool, and choose the mode deliberately: `exact` answers \"where does this exact image appear?\" (original page, credits, reuse), `visual` answers \"what looks like this?\" (similar photos, products, related pages).",
-        "Results link to the pages Google found, not to the image file: use visit_page on a result page when you need its content or the image in context. Every exact match shows the uploaded image itself, so those results do not repeat an image URL; visual matches include the matched image URL.",
+        "Results link to the pages Google found, not to the image file: use visit_page on a result page when you need its content or the image in context. Every exact match shows the uploaded image itself, so those results do not repeat an image URL. Visual matches include the matched image URL.",
       ],
       parameters: googleSearchByImageParams,
       async execute(_toolCallId, params, _signal, onUpdate) {
@@ -1146,18 +849,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
   // visit_page is (re)registered from the current config by syncVisitPageTool().
   // The flags (`summaryEnabled`, `cleanEnabled`) hide their option and every
   // mention of it from the model. Pi replaces a same-named tool and refreshes
-  // the registry in the same session, so /browse on|off and /browse clean
-  // on|off take effect on the next turn.
+  // the registry in the same session.
   const syncVisitPageTool = () => pi.registerTool(visitPageToolDefinition());
   syncVisitPageTool();
-
-  // Commands
-
-  pi.registerCommand("google-search-kill", {
-    description: "Kill the Google Search Chrome browser process",
-    handler: async (_args, ctx) => {
-      await shutdownChrome();
-      ctx.ui.notify("Google Search Chrome killed. The next search relaunches it, applying any proxy change.", "info");
-    },
-  });
 }

@@ -326,7 +326,7 @@ class CDPClient implements CDPLike {
 
 let chromeProcess: ChildProcess | null = null;
 // Serializes Chrome start/restart decisions across parallel tool calls (see
-// withChromeLifecycle). Also covers shutdownChrome().
+// withChromeLifecycle).
 let chromeLifecycle: Promise<unknown> = Promise.resolve();
 // Args of the Chrome started by this process (null when the live Chrome was
 // started elsewhere - an earlier Pi session using the same profile).
@@ -1068,7 +1068,7 @@ async function readDownload(cdp: CDPLike, url: string, onStatus: StatusFn): Prom
 
   const note =
     `The URL is a file download (${ct}, ${formatBytes(total)}), not a web page.` +
-    (info.decoded ? " The server sent it base64-encoded; the text below is decoded." : "") +
+    (info.decoded ? " The server sent it base64-encoded. The text below is decoded." : "") +
     (text.length < (info.decoded || rawText).length
       ? ` Showing the first ${DOWNLOAD_TEXT_MAX.toLocaleString("en-US")} characters.`
       : "");
@@ -2033,12 +2033,8 @@ export async function visitPage(
     { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true, safetyExtract: true, contentFirst: true });
 }
 
-export async function shutdownChrome(): Promise<void> {
-  await withChromeLifecycle(() => stopChrome());
-}
-
 // Exported for testing - internal API, not part of the extension's tool surface
-// (index.ts only re-exports googleSearch, visitPage, shutdownChrome).
+// (index.ts only imports googleSearch, visitPage, and the reverse-image helpers).
 // Extractor JS strings + URL classifiers are re-exported from ./extractors.ts
 // so existing test imports from chrome.ts keep working.
 export {

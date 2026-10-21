@@ -26,7 +26,7 @@ When you call `google_search`, `google_image_search`, `google_search_by_image`, 
 - A visible Chrome window opens (not headless) with a dedicated profile at `~/.pi-search-browser/`
 - Chrome DevTools Protocol (CDP) is used to navigate and extract content
 - JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar. [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`. Generic pages come back as main text plus images and navigation links
-- Chrome stays alive between calls for speed (kill with `/google-search-kill`)
+- Chrome stays alive between calls for speed
 
 ## Tools
 
@@ -136,8 +136,8 @@ Visit any URL and get the page content as markdown. Two parameters keep large pa
 `summary` and `clean` are required on every call while their mode is enabled
 (both are on by default), so the schema asks for `true` or `false` explicitly.
 Disable a mode with `"summaryEnabled": false` / `"cleanEnabled": false` in the
-config file, `PI_BROWSE_SUMMARY_ENABLED=0` / `PI_BROWSE_CLEAN_ENABLED=0`, or
-`/browse off` / `/browse clean off`: its parameter is then removed from the tool
+config file, or `PI_BROWSE_SUMMARY_ENABLED=0` / `PI_BROWSE_CLEAN_ENABLED=0`:
+its parameter is then removed from the tool
 schema (including the `required` list) and every mention of it disappears from
 the description, prompt snippet, and guidelines - the model is not told the
 option exists. Disabling one feature never affects the other, `url`, or
@@ -225,11 +225,10 @@ visit_page({ url: "https://react.dev/reference/react/useState", clean: false, su
 - The page is fetched exactly as usual (your visible Chrome, all the
   site-specific extractors above still run). Only the *return value* changes.
 - The subagent reuses your current Pi model by default (no API keys to
-  set up - Pi's already-configured auth is used). Pin a different model with
-  `/browse` if you want a cheaper/faster one for summarization.
+  set up - Pi's already-configured auth is used).
 - The footer shows a `🌐 provider/model` indicator only when the subagent is
-  pinned to a model different from your session model (run `/browse` with no
-  arguments to see what it resolves to). An animated spinner appears while the
+  pinned to a model different from your session model.
+  An animated spinner appears while the
   subagent is summarizing. Reusing the session model needs no indicator -
   Pi's own footer already shows that model.
 - The collapsed tool result shows the context savings, e.g.
@@ -239,17 +238,14 @@ This mirrors the subagent pattern from the
 [pi-vision-tool](https://github.com/xezpeleta/pi-vision-tool) extension.
 
 Disabling summary mode. Set `"summaryEnabled": false` in
-`~/.pi/agent/search-on-your-browser.json` (or run `/browse off`, or start Pi with
+`~/.pi/agent/search-on-your-browser.json` (or start Pi with
 `PI_BROWSE_SUMMARY_ENABLED=0`) and `visit_page` stops offering `summary` at all:
 the parameter is removed from the tool schema, and the description, prompt
 snippet, and guidelines are swapped for variants that never mention it. The model
 is not told the option exists, and pages are always returned as extracted
-markdown. Your pinned model and settings are kept, so `/browse on` restores the
-option on the next turn. This differs from the old behavior, where a disabled
-subagent still advertised `summary` and returned an error when the model used
-it.
+markdown.
 
-Disabling clean mode. `"cleanEnabled": false` (or `/browse clean off`, or
+Disabling clean mode. `"cleanEnabled": false` (or
 `PI_BROWSE_CLEAN_ENABLED=0`) hides the `clean` option the same way: the
 parameter is removed and every mention of it disappears - including the
 "Combine with `clean: true`" sentence in the summary parameter's own
@@ -435,11 +431,6 @@ Status-specific hints:
 | 429 | Rate limited - wait and retry |
 | 5xx | Server or gateway error - the tool reloads once. If it persists, retry shortly or try a different URL |
 
-## Commands
-
-- `/browse` - Configure the `visit_page` subagent and the Chrome proxy (see below).
-- `/google-search-kill` - Kill the Chrome browser.
-
 ### Troubleshooting: Chrome launch flags are applied automatically
 
 `visit_page` drives a visible Chrome that `pi-search-on-your-browser`
@@ -451,8 +442,8 @@ already-running Chrome is detected as stale and restarted automatically on
 the next tool call ("Restarting Chrome to apply updated launch flags..."
 appears in the tool call block).
 
-You can still force a restart yourself at any time with `/google-search-kill`
-(or `pkill -f remote-debugging-port=9322`). The next tool call relaunches
+You can still force a restart yourself at any time with
+`pkill -f remote-debugging-port=9322`. The next tool call relaunches
 Chrome. Symptoms of a stale Chrome: `visit_page` hangs for ~30s on lazy-load
 pages (e.g. `github.com`) and fails with `CDP call timeout: Runtime.evaluate`
 when Chrome's window is in the background.
@@ -497,7 +488,7 @@ propagate immediately. If a navigation still fails after all attempts, the
 error says so explicitly (`... after 3 attempts of 15s - the page or the proxy
 may be slow`), which is the signal to retry the tool call or check the proxy.
 
-### `/browse` - subagent configuration
+### Subagent configuration
 
 `visit_page`'s `summary` mode uses a subagent model to read the page and
 return only a concise summary, keeping your chat context small. The subagent
@@ -508,41 +499,31 @@ no separate API keys to set up, and every Pi provider works (OpenAI-compatible,
 Anthropic, Google, Bedrock, ...).
 
 By default the subagent reuses your current session model (the one you're
-chatting with). So `summary` mode works with zero configuration. Use `/browse`
-only if you want to pin a different (e.g. cheaper/faster) model:
-
-```
-/browse                          # show current config
-/browse on                       # enable summary mode (default)
-/browse off                      # disable: hide `summary` from the model, raw pages are returned
-/browse clean on|off             # enable/disable clean mode (hide `clean` from the model)
-/browse provider openai          # pin a provider (overrides current model)
-/browse model gpt-4o-mini        # pin a model (overrides current model)
-/browse max-tokens 2048          # max output tokens for the summary
-/browse reasoning-effort low     # off|minimal|low|medium|high|xhigh
-/browse clear                    # unpin -> back to current model
-```
-
-Shorthand: `/browse provider openai` and `/browse model gpt-4o-mini` work
-without the `config` prefix.
+chatting with). So `summary` mode works with zero configuration.
 
 When the subagent is pinned to a different model, the footer shows
 `🌐 provider/model`. Otherwise no indicator appears, because the session model
-it reuses is already in Pi's footer. Run `/browse` with no arguments to see
-the resolved configuration.
+it reuses is already in Pi's footer.
 
-Configuration is persisted to `~/.pi/agent/search-on-your-browser.json` and
-also recorded in the session file, so changes survive across sessions and are
-restored when you reopen one.
+The config file is optional - every key falls back to an environment variable,
+then to the session model or a built-in default. It is read
+when a session starts, so a new session picks up changes (no Pi restart).
 
 ```jsonc
 // ~/.pi/agent/search-on-your-browser.json
 {
   "summaryEnabled": false,             // hide visit_page's `summary` option entirely
   "cleanEnabled": false,               // hide visit_page's `clean` option entirely
+  "provider": "openai",                // pin a subagent provider (optional)
+  "model": "gpt-4o-mini",              // pin a subagent model (optional)
+  "maxTokens": 2048,                   // max output tokens for the summary
+  "defaultReasoningEffort": "off",     // off|minimal|low|medium|high|xhigh
   "browser": { "proxy": "http://127.0.0.1:8010" }
 }
 ```
+
+`provider` and `model` go together (`maxTokens` defaults to `2048`). Leave both
+out to reuse the session model.
 
 Environment variables (optional - override the current-model default at
 startup. The config file wins over these once set):
@@ -576,17 +557,12 @@ the CDP-driven navigations - so the whole tool keeps working. You do *not* need
 
 Accepted forms: a full URL (`http://`, `https://`, `socks4://`, `socks5://`),
 credentials (`http://user:pass@proxy:3128`), or a bare `host:port` (the scheme
-defaults to `http://`). Localhost is never proxied. Set it interactively, or
-with the `PI_SEARCH_PROXY` environment variable (the config file wins once set):
-
-```
-/browse proxy http://127.0.0.1:8010   # or: /browse config proxy ...
-/browse proxy off                     # connect directly again
-/browse                               # shows the effective proxy
-```
+defaults to `http://`). Localhost is never proxied. Set it in the config file,
+or with the `PI_SEARCH_PROXY` environment variable (the config file wins once
+set).
 
 Changing the proxy takes effect on the next tool call: the running Chrome is
-restarted with the new flag (no Pi restart, no manual `/google-search-kill`).
+restarted with the new flag (no Pi restart).
 
 ## Requirements
 
@@ -606,12 +582,12 @@ pnpm install
 pnpm test
 ```
 
-Nine layers of tests (178 total):
+Nine layers of tests (167 total):
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
 - `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget. Client-side redirects are waited out (`waitForSettledDocument`), the pre-scroll extraction is kept when the page navigates away mid-visit, a tab that lands on Chrome's error page re-navigates once, and specialized extractors still run exactly once. The wall/download paths are covered too: a bot-check page that clears is extracted after the tab is activated, one that does not returns a `__BLOCKED__: challenge` marker (likewise `captcha` and `login`), a visible bot-check widget is clicked at the checkbox coordinates (then at the widget centre) and an off-screen duplicate is ignored, no click happens for a JavaScript-only challenge, a text download is read through a same-origin `fetch()` and returned fenced (base64 decoded), a binary download is reported, and a host/path-changing redirect adds a `> Redirected:` line.
-- `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
-- `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
+- `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), and tolerance of a malformed file. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
+- `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.
 - `tests/unit/image-search.test.ts` - covers Google Images: `clampImageCount` (default, floors, clamps, non-numbers) and the generated extractor (`getGoogleImageSearchJs`) - it parses as JavaScript, embeds the clamped count, keeps the DOM contract it depends on (data-lpage tiles, the preview image selector, gstatic detection, the `(google-cached)` marker, and both the image and page URL lines), and bounds its own runtime against the CDP timeout. No browser, no network.
 - `tests/unit/reverse-image.test.ts` - covers `google_search_by_image`'s pure parts: path resolution (absolute, cwd-relative, `~`), image signature sniffing (PNG/JPEG/GIF/WebP/BMP and rejections), `readImageFile` (missing/empty/non-file/non-image errors), the 20 MB limit, the exact/visual mode helpers, and the generated extractor for both modes (parses, differs per mode, keeps the Lens/web/grid card selectors, caps results, emits absolute page links for the redirect resolver). No browser, no network.

@@ -8,9 +8,8 @@
 // `visitPageSurface()` and `visitPageParameters()` build the text and schema for
 // the current flags, so what the model sees stays minimal and only grows as
 // features are enabled: base -> +clean -> +summary. A disabled feature must be
-// invisible to the model: no string may mention it (or point at /browse for
-// it), and its parameter is dropped from the schema. Keeping this here makes it
-// testable for every combination.
+// invisible to the model: no string may mention it, and its parameter is dropped
+// from the schema. Keeping this here makes it testable for every combination.
 
 import { Type } from "typebox";
 
@@ -38,8 +37,7 @@ const DESCRIPTION_CLEAN =
 
 const DESCRIPTION_SUMMARY =
   " Pass `summary: true` to have a configurable subagent model read the page and return only a concise summary of ALL the information on it - " +
-  "the raw page markdown is NOT added to your chat context, which keeps large pages from filling it. " +
-  "Configure the subagent with /browse.";
+  "the raw page markdown is NOT added to your chat context, which keeps large pages from filling it.";
 
 const SNIPPET_BASE =
   "visit_page: visit a URL in your visible browser, returns rendered markdown.";
@@ -47,7 +45,7 @@ const SNIPPET_BASE =
 const SNIPPET_CLEAN = " Pass `clean: true` for just the main article content.";
 
 const SNIPPET_SUMMARY =
-  " Pass `summary: true` to get only a concise subagent summary of the page instead of the full page markdown (keeps context small); configure via /browse.";
+  " Pass `summary: true` to get only a concise subagent summary of the page instead of the full page markdown (keeps context small).";
 
 const CORE_GUIDELINES = [
   "Use visit_page to read a web page you found via google_search. It opens in your visible Chrome so authenticated/paywalled sites work.",
@@ -57,16 +55,16 @@ const CLEAN_GUIDELINE =
   "visit_page accepts a `clean` flag. For articles, docs, or blog posts, pass `clean: true` to extract only the main article content as clean Markdown (drops nav/sidebars/ads/footer) - far fewer tokens. Pass `clean: false` on non-article pages (dashboards, indexes with no clear main content) where it may extract the wrong block or nothing. Note: `clean` preserves content links (article URLs, citations, story links) but drops chrome links (nav bars, sidebars, footers, action buttons) - so it's fine for gathering content links, but pass `false` if you specifically need nav/footer links (e.g. finding the 'About' or 'Contact' page URL).";
 
 const SUMMARY_GUIDELINE =
-  "visit_page accepts a `summary` flag. Pass `summary: true` and the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown never enters your chat context. This keeps large pages (docs, articles, product pages) from filling the conversation. The subagent reuses your current Pi model by default (no setup needed); pin a different one with /browse. Prefer `summary` for large pages where you do not need every word verbatim. Pass `summary: false` when you need verbatim text (code snippets, API signatures, exact numbers, error messages) since the subagent paraphrases; when the page is already small; or when the page content itself is the deliverable.";
+  "visit_page accepts a `summary` flag. Pass `summary: true` and the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown never enters your chat context. This keeps large pages (docs, articles, product pages) from filling the conversation. The subagent reuses your current Pi model by default (no setup needed). Prefer `summary` for large pages where you do not need every word verbatim. Pass `summary: false` when you need verbatim text (code snippets, API signatures, exact numbers, error messages) since the subagent paraphrases, when the page is already small, or when the page content itself is the deliverable.";
 
 const RESEARCH_GUIDELINE =
-  "For research tasks - reading multiple papers, articles, or docs - use `clean: true` + `summary: true` together by default. `clean` gives the subagent pure article text (no nav noise, no 90KB truncation) so its summary is faster and more reliable; `summary` keeps each page's full content out of your context. This combination is the optimal pattern for intensive research: search -> visit each result with clean+summary -> synthesize from the concise summaries.";
+  "For research tasks - reading multiple papers, articles, or docs - use `clean: true` + `summary: true` together by default. `clean` gives the subagent pure article text (no nav noise, no 90KB truncation) so its summary is faster and more reliable. `summary` keeps each page's full content out of your context. This combination is the optimal pattern for intensive research: search -> visit each result with clean+summary -> synthesize from the concise summaries.";
 
 const CLEAN_PARAM_DESCRIPTION =
   "Extract only the page's main article content as clean Markdown instead of the default page extraction. Drops navigation, sidebars, ads, footers, and the visible-links dump - far fewer tokens. Best for articles, docs, blog posts. Set `false` on non-article pages (dashboards, indexes) where there is no clear main content. Falls back to the default extraction if no article content is found. Preserves content links (article URLs, citations) but drops chrome links (nav/footer/action buttons).";
 
 const SUMMARY_PARAM_BASE =
-  "When true, the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown is NOT added to your chat context. Use this for large pages to keep the conversation compact. The subagent reuses your current Pi model by default; pin a different one with /browse.";
+  "When true, the full page content is read by a subagent model that returns only a concise summary of ALL the information on the page - the raw page markdown is NOT added to your chat context. Use this for large pages to keep the conversation compact. The subagent reuses your current Pi model by default.";
 
 const SUMMARY_PARAM_CLEAN =
   " Combine with `clean: true` for articles (gives the subagent clean text, avoiding nav noise and truncation).";
