@@ -57,9 +57,9 @@ test("optional guidelines appear exactly when their feature (and combination) is
   const noClean = visitPageSurface({ summaryEnabled: true, cleanEnabled: false });
   const neither = visitPageSurface({ summaryEnabled: false, cleanEnabled: false });
 
-  const hasSummaryGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("accepts a `summary` flag"));
-  const hasCleanGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("accepts a `clean` flag"));
-  const hasResearchGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("For research tasks"));
+  const hasSummaryGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("`summary: true`"));
+  const hasCleanGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("`clean: true`"));
+  const hasResearchGuideline = (s: typeof summary) => s.promptGuidelines.some((g) => g.includes("multi-page research"));
 
   assert.ok(hasSummaryGuideline(summary) && hasCleanGuideline(summary) && hasResearchGuideline(summary));
   assert.ok(!hasSummaryGuideline(noSummary) && hasCleanGuideline(noSummary) && !hasResearchGuideline(noSummary));
@@ -150,11 +150,18 @@ test("no site-specific extractor names appear in the tool surface", () => {
   }
 });
 
-test("the description stays minimal and grows monotonically with the flags", () => {
+test("the description and snippet stay constant and minimal. Only guidelines grow", () => {
   const none = visitPageSurface({ summaryEnabled: false, cleanEnabled: false });
   const clean = visitPageSurface({ summaryEnabled: false, cleanEnabled: true });
   const summary = visitPageSurface({ summaryEnabled: true, cleanEnabled: false });
   const both = visitPageSurface({ summaryEnabled: true, cleanEnabled: true });
+
+  // The schema explains the options, so the description and snippet never
+  // repeat them - they stay identical across every combination.
+  for (const surface of [clean, summary, both]) {
+    assert.equal(surface.description, none.description);
+    assert.equal(surface.promptSnippet, none.promptSnippet);
+  }
 
   // Minimal base: no extraction details are spelled out.
   for (const verbose of ["ASIN", "permalink", "citation count", "timestamp", "availability"]) {
@@ -164,18 +171,11 @@ test("the description stays minimal and grows monotonically with the flags", () 
     );
   }
 
-  // Base -> +clean -> +summary, so the surface only grows as features are on.
-  assert.ok(clean.description.startsWith(none.description));
-  assert.ok(both.description.startsWith(clean.description));
-  assert.ok(summary.description.startsWith(none.description));
-  assert.ok(clean.description.length > none.description.length);
-  assert.ok(summary.description.length > none.description.length);
-  assert.ok(both.description.length > clean.description.length);
-  assert.ok(both.description.length > summary.description.length);
-
-  assert.ok(clean.promptSnippet.startsWith(none.promptSnippet));
-  assert.ok(both.promptSnippet.startsWith(clean.promptSnippet));
-  assert.ok(both.promptSnippet.length > none.promptSnippet.length);
+  // Only the guidance grows, and only when its feature is on.
+  assert.ok(clean.promptGuidelines.length > none.promptGuidelines.length);
+  assert.ok(summary.promptGuidelines.length > none.promptGuidelines.length);
+  assert.ok(both.promptGuidelines.length > clean.promptGuidelines.length);
+  assert.ok(both.promptGuidelines.length > summary.promptGuidelines.length);
 });
 
 test("stripDisabledArguments: removes exactly the disabled arguments", () => {

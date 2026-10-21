@@ -588,11 +588,8 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       name: "google_search",
       label: "Google Search",
       description:
-        "Search Google in your visible Chrome browser and return compact Markdown links. Uses your real browser fingerprint - no API keys, no headless detection.",
-      promptSnippet: "google_search: search Google in your visible browser. Returns markdown links",
-      promptGuidelines: [
-        "Use google_search to find web pages when you need real-time information. Results include clickable markdown links.",
-      ],
+        "Search Google in your visible Chrome browser. Returns links.",
+      promptSnippet: "Google search. Returns links.",
       parameters: googleSearchParams,
       async execute(_toolCallId, params, _signal, onUpdate) {
         const { query } = params;
@@ -662,8 +659,7 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       Type.Integer({
         minimum: 1,
         maximum: 12,
-        description:
-          "How many image results to return (1-12, default 8). Each result is opened in Google's preview panel to resolve the original image URL, so higher counts take longer.",
+        description: "How many image results to return (1-12, default 8). Higher counts are slower.",
       }),
     ),
   });
@@ -673,12 +669,9 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       name: "google_image_search",
       label: "Google Image Search",
       description:
-        "Search Google Images in your visible Chrome browser. Every result gives the image URL and the URL of the page the image was found on, plus the page title and, when known, the image size. The original image URL is resolved through Google's preview panel. When a site blocks hotlinking, Google's cached thumbnail is returned instead (marked google-cached). Uses your real browser fingerprint - no API keys, no headless detection.",
+        "Search Google Images in your visible Chrome browser. Each result gives the image URL, the page URL it appears on, title, and size. Hotlink-blocked images fall back to Google's cached thumbnail (marked google-cached).",
       promptSnippet:
-        "google_image_search: search Google Images in your visible browser. Returns each image URL with the page URL it came from",
-      promptGuidelines: [
-        "Use google_image_search when you need pictures, diagrams, charts, or screenshots and want to know where they come from. Each result carries the image URL (original when the site allows hotlinking, otherwise Google's cached thumbnail, marked google-cached) and the page URL the image appears on - visit_page that page when you need the context around the image.",
-      ],
+        "Google Images. Returns each image URL with the page URL it appears on.",
       parameters: googleImageSearchParams,
       async execute(_toolCallId, params, _signal, onUpdate) {
         const { query, count } = params;
@@ -754,11 +747,11 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
   const googleSearchByImageParams = Type.Object({
     path: Type.String({
       description:
-        "Path to a local image file - absolute, or relative to the current working directory (like the read tool). PNG, JPEG, GIF, WebP or BMP, up to 20 MB.",
+        "Local image path (absolute, relative to cwd, or `~/...`), up to 20 MB.",
     }),
     mode: Type.Union([Type.Literal("exact"), Type.Literal("visual")], {
       description:
-        "Which result set to return. `exact`: pages that show the same image (find its sources/usage). `visual`: visually similar images and the pages they appear on (find lookalikes/context).",
+        "`exact`: find sources/usage. `visual`: find lookalikes/context.",
     }),
   });
 
@@ -767,13 +760,8 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
       name: "google_search_by_image",
       label: "Google Search by Image",
       description:
-        "Reverse image search: upload a local image file to Google Lens in your visible Chrome browser and return where it appears. `mode: \"exact\"` lists the pages that show the same image; `mode: \"visual\"` lists visually similar images and the pages they appear on. Each result carries the page URL, the source site, and (when available) the matched image URL. Uses your real browser session - no API keys, no headless detection.",
-      promptSnippet:
-        "google_search_by_image: upload a local image file to Google Lens. Returns the pages showing the same image (exact) or visually similar images (visual)",
-      promptGuidelines: [
-        "Use google_search_by_image when you have a local image file (a screenshot, a downloaded picture) and need its source or lookalikes. Pass the path exactly as you would to the read tool, and choose the mode deliberately: `exact` answers \"where does this exact image appear?\" (original page, credits, reuse), `visual` answers \"what looks like this?\" (similar photos, products, related pages).",
-        "Results link to the pages Google found, not to the image file: use visit_page on a result page when you need its content or the image in context. Every exact match shows the uploaded image itself, so those results do not repeat an image URL. Visual matches include the matched image URL.",
-      ],
+        "Reverse image search: upload a local image file to Google Lens and return the pages where it appears, with their sources.",
+      promptSnippet: "Reverse image search from a local image file.",
       parameters: googleSearchByImageParams,
       async execute(_toolCallId, params, _signal, onUpdate) {
         const { path, mode } = params;
