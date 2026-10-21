@@ -13,6 +13,9 @@
 //                       URL of the page the image was found on (plus title and size). The
 //                       original image URL is resolved through Google's preview panel. Hosts
 //                       that block hotlinking fall back to Google's cached thumbnail.
+//   - google_search_by_image - Reverse image search: upload a local image file to Google Lens
+//                       and return the pages showing the same image (`mode: "exact"`) or
+//                       visually similar images and their pages (`mode: "visual"`).
 //   - visit_page      - Visit a URL in a visible Chrome browser, returns rendered page as markdown.
 //                       X (Twitter) URLs get a dedicated tweet extractor (search/profile/tweet).
 //                       Reddit post URLs get a dedicated comment extractor (post + threaded comments).
@@ -53,7 +56,7 @@ import {
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { googleSearch, googleImageSearch, visitPage, shutdownChrome, type SearchResult } from "./src/chrome.js";
+import { googleSearch, googleImageSearch, reverseImageSearch, visitPage, shutdownChrome, type SearchResult } from "./src/chrome.js";
 import {
   config,
   reloadConfig,
@@ -100,6 +103,11 @@ interface GoogleSearchDetails {
 
 interface GoogleImageSearchDetails extends GoogleSearchDetails {
   count?: number;
+}
+
+interface GoogleSearchByImageDetails extends GoogleSearchDetails {
+  mode?: string;
+  path?: string;
 }
 
 // First text block of a tool result, or "" when there is none.
@@ -1026,6 +1034,102 @@ export default function searchOnYourBrowser(pi: ExtensionAPI) {
         const details = result.details;
         if (!expanded) {
           const parts: string[] = [];
+          if (details?.chars) parts.push(`${details.chars.toLocaleString()} chars`);
+          if (details?.elapsed) parts.push(details.elapsed);
+          if (details?.url) parts.push(new URL(details.url).hostname);
+          return new Text(theme.fg("muted", ` -> ${parts.join(" - ")}`), 0, 0);
+        }
+
+        const text = resultText(result);
+        return new Text(`\n${text.split("\n").map((l) => theme.fg("toolOutput", l)).join("\n")}`, 0, 0);
+      },
+    }),
+  );
+
+  // google_search_by_image tool
+
+  const googleSearchByImageParams = Type.Object({
+    path: Type.String({
+      description:
+        "Path to a local image file - absolute, or relative to the current working directory (like the read tool). PNG, JPEG, GIF, WebP or BMP, up to 20 MB.",
+    }),
+    mode: Type.Union([Type.Literal("exact"), Type.Literal("visual")], {
+      description:
+        "Which result set to return. `exact`: pages that show the same image (find its sources/usage). `visual`: visually similar images and the pages they appear on (find lookalikes/context).",
+    }),
+  });
+
+  pi.registerTool(
+    defineTool<typeof googleSearchByImageParams, GoogleSearchByImageDetails>({
+      name: "google_search_by_image",
+      label: "Google Search by Image",
+      description:
+        "Reverse image search: upload a local image file to Google Lens in your visible Chrome browser and return where it appears. `mode: \"exact\"` lists the pages that show the same image; `mode: \"visual\"` lists visually similar images and the pages they appear on. Each result carries the page URL, the source site, and (when available) the matched image URL. Uses your real browser session - no API keys, no headless detection.",
+      promptSnippet:
+        "google_search_by_image: upload a local image file to Google Lens; returns the pages showing the same image (exact) or visually similar images (visual)",
+      promptGuidelines: [
+        "Use google_search_by_image when you have a local image file (a screenshot, a downloaded picture) and need its source or lookalikes. Pass the path exactly as you would to the read tool, and choose the mode deliberately: `exact` answers \"where does this exact image appear?\" (original page, credits, reuse), `visual` answers \"what looks like this?\" (similar photos, products, related pages).",
+        "Results link to the pages Google found, not to the image file: use visit_page on a result page when you need its content or the image in context. Every exact match shows the uploaded image itself, so those results do not repeat an image URL; visual matches include the matched image URL.",
+      ],
+      parameters: googleSearchByImageParams,
+      async execute(_toolCallId, params, _signal, onUpdate) {
+        const { path, mode } = params;
+        if (!path || !path.trim()) {
+          return {
+            content: [{ type: "text" as const, text: "Tool error: google_search_by_image requires an image path." }],
+            details: {},
+          };
+        }
+
+        try {
+          const started = Date.now();
+          const result = await reverseImageSearch(path.trim(), {
+            mode,
+            onStatus: (msg) => {
+              onUpdate?.({
+                content: [{ type: "text", text: msg }],
+                details: { _progress: true },
+              });
+            },
+          });
+          const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+          return {
+            content: [{ type: "text" as const, text: result.markdown }],
+            details: {
+              url: result.url,
+              elapsed: `${elapsed}s`,
+              chars: result.markdown.length,
+              mode,
+              path,
+            },
+          };
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`google_search_by_image failed: ${message}`);
+        }
+      },
+
+      renderCall(args, theme) {
+        const base = (args.path || "").split(/[\\/]/).pop() || "";
+        const mode = args.mode ? theme.fg("dim", ` ${args.mode}`) : "";
+        return new Text(
+          `${theme.fg("toolTitle", theme.bold("google_search_by_image"))} ${theme.fg("accent", base)}${mode}`,
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, { expanded, isPartial }, theme) {
+        if (isPartial) {
+          const progress = resultText(result) || "Searching...";
+          return new Text(theme.fg("warning", progress), 0, 0);
+        }
+
+        const details = result.details;
+        if (!expanded) {
+          const parts: string[] = [];
+          if (details?.mode) parts.push(details.mode);
           if (details?.chars) parts.push(`${details.chars.toLocaleString()} chars`);
           if (details?.elapsed) parts.push(details.elapsed);
           if (details?.url) parts.push(new URL(details.url).hostname);

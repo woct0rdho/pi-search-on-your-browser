@@ -187,6 +187,118 @@ export function getGoogleImageSearchJs(count: number): string {
 })()`;
 }
 
+// Google search by image (Lens). The uploaded image is analyzed by Lens, which
+// renders two result sets behind tabs that are plain URLs: `udm=48` = exact
+// matches (pages showing the same image), `udm=44` = visual matches (visually
+// similar images and the pages they appear on). Result cards come in two
+// layouts: Lens cards (`a.LBcIee`: a heading, the source name, and a thumbnail
+// in the card root) and the older grid (`a[href*="/goto?url="]` wrapping the
+// matched image, with "title date · WxH source" as its text). Page links are
+// `/goto?url=<opaque>` wrappers and are resolved afterwards by
+// src/google-links.ts, exactly like google_search results.
+export type ReverseImageMode = "exact" | "visual";
+export const REVERSE_IMAGE_MODES: readonly ReverseImageMode[] = ["exact", "visual"];
+
+// True for the values the tool accepts as a mode.
+export function isReverseImageMode(value: unknown): value is ReverseImageMode {
+  return value === "exact" || value === "visual";
+}
+
+export function getReverseImageSearchJs(mode: ReverseImageMode): string {
+  const label = mode === "exact" ? "exact matches" : "visual matches";
+  return `(() => {
+  const clean = s => (s || "").replace(/\\s+/g, " ").trim();
+  const abs = u => { try { return new URL(u, location.href).href; } catch { return ""; } };
+  const host = u => { try { return new URL(u).hostname; } catch { return ""; } };
+  const googleHost = u => /(^|\\.)google\\./.test(host(u)) || /(^|\\.)gstatic\\.com$/.test(host(u)) || /(^|\\.)googleusercontent\\.com$/.test(host(u));
+
+  const rows = [];
+  const seen = new Set();
+  const LIMIT = 12;
+  const add = (title, href, image, source, size) => {
+    if (rows.length >= LIMIT) return;
+    const page = abs(href);
+    if (!page) return;
+    const wrapper = /\\/(goto|url)\\?/.test(page);
+    if (!wrapper && googleHost(page)) return;   // Google's own pages are chrome, not results
+    if (seen.has(page)) return;
+    seen.add(page);
+    rows.push({
+      title: clean(title), page: page,
+      image: /^https?:/i.test(image || "") ? image : "",
+      source: clean(source || ""), size: clean(size || ""),
+    });
+  };
+
+  // Web results: the exact-match view renders pages as ordinary search
+  // results - an anchor with an <h3> title, a displayed URL breadcrumb, and a
+  // favicon (no image of the match itself).
+  for (const a of document.querySelectorAll('a[href*="/goto?url="]')) {
+    const h3 = a.querySelector("h3");
+    if (!h3) continue;
+    const crumb = a.querySelector(".byrV5b") || a.querySelector(".CA5RN") || a.querySelector(".notranslate");
+    const crumbText = crumb ? clean(crumb.innerText) : "";
+    const hostMatch = crumbText.match(/(?:https?:\\/\\/)?([a-z0-9-]+(?:\\.[a-z0-9-]+)+)/i);
+    add(clean(h3.innerText), a.getAttribute("href") || "", "", hostMatch ? hostMatch[1] : "", "");
+  }
+
+  // Lens cards: title in [role=heading], source in .R8BTeb, thumbnail in the
+  // card root (the anchor only wraps the text, not the image).
+  for (const a of document.querySelectorAll("a.LBcIee")) {
+    const root = a.closest("div.vEWxFf") || a.parentElement;
+    const img = root ? (root.querySelector("img.VeBrne") || root.querySelector('img[src^="https:"]')) : null;
+    add(
+      a.querySelector("[role=heading]") ? a.querySelector("[role=heading]").innerText : "",
+      a.getAttribute("href") || "",
+      img ? img.getAttribute("src") || "" : "",
+      a.querySelector(".R8BTeb") ? a.querySelector(".R8BTeb").innerText : "",
+      "",
+    );
+  }
+
+  // Older exact-match grid: the anchor wraps the image. Its text is
+  // "<title> <date> · <WxH> <source>".
+  const DATE = /\\s+(?:[A-Z][a-z]{2,8}\\.?\\s+\\d{1,2},\\s+\\d{4}|\\d{1,2}\\s+[A-Z][a-z]{2,8}\\.?\\s+\\d{4}|\\d{4}-\\d{2}-\\d{2}|\\d{1,2}\\/\\d{1,2}\\/\\d{2,4})/;
+  for (const a of document.querySelectorAll('a[href*="/goto?url="]')) {
+    if (a.querySelector("h3") || a.classList.contains("LBcIee")) continue;
+    const img = a.querySelector("img");
+    if (!img) continue;
+    const text = clean(a.innerText);
+    if (text.length < 8) continue;
+    const dims = text.match(/(\\d{1,3}(?:[.,]\\d{3})?)\\s*[×x]\\s*(\\d{1,3}(?:[.,]\\d{3})?)/);
+    const cut = text.search(DATE);
+    // Only real result cards carry the date / dimensions metadata. This keeps
+    // chrome links that happen to contain an image out of the results.
+    if (!dims && cut <= 0) continue;
+    const src = img.getAttribute("src") || "";
+    const source = dims ? text.slice(dims.index + dims[0].length).trim().slice(0, 60) : "";
+    const metaAt = Math.min(cut > 0 ? cut : Infinity, dims ? dims.index : Infinity);
+    add(
+      metaAt < Infinity ? text.slice(0, metaAt).trim() : text,
+      a.getAttribute("href") || "",
+      /^https?:/i.test(src) ? src : "",   // inlined (data:) thumbnails are the uploaded image itself
+      source,
+      dims ? dims[1].replace(/[.,]/g, "") + "x" + dims[2].replace(/[.,]/g, "") : "",
+    );
+  }
+
+  const lines = ["# Google search by image - ${label}", "", "URL: " + location.href, ""];
+  rows.forEach((r, i) => {
+    const title = r.title || r.source || host(r.page) || "(untitled)";
+    lines.push((i + 1) + ". [" + title.replace(/[\\[\\]]/g, "") + "](" + r.page + ")");
+    if (r.source) lines.push("   source: " + r.source);
+    if (r.image) lines.push("   image: " + r.image);
+    if (r.size) lines.push("   size: " + r.size);
+  });
+  if (!rows.length) {
+    lines.push("(no results found - the image may have no matches, or the page is a consent / bot-check screen)");
+    lines.push("");
+    lines.push(clean(document.body.innerText).slice(0, 400));
+  }
+  return lines.join("\\n");
+})()`;
+}
+
 // Generic page extractor (fallback / default)
 //
 // A reader for the wild web rather than for article layouts: blogs, forums

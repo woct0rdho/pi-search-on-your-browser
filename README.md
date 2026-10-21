@@ -1,11 +1,12 @@
 # pi-search-on-your-browser
 
-Search Google and browse the web in your own visible Chrome browser - no API keys, no headless detection, your real cookies and login sessions. A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that gives your coding agent three tools: `google_search`, `google_image_search`, and `visit_page`.
+Search Google and browse the web in your own visible Chrome browser - no API keys, no headless detection, your real cookies and login sessions. A [Pi](https://github.com/earendil-works/pi-coding-agent) extension that gives your coding agent four tools: `google_search`, `google_image_search`, `google_search_by_image`, and `visit_page`.
 
 ## Highlights
 
 - Google search via your real browser - returns compact markdown links + snippets
 - Google image search - every result comes with the image URL and the URL of the page it appears on, plus title and size. The original file is resolved through Google's preview panel when the site allows it
+- Reverse image search - upload a local image file to Google Lens and get the pages showing that exact image (`exact`) or visually similar images and their pages (`visual`)
 - `visit_page` fetches any URL as markdown using your visible Chrome (authenticated everywhere - paywalled sites, X, Reddit, Amazon, GitHub)
 - `clean` extraction - reader-mode markdown via [Defuddle](https://github.com/kepano/defuddle) (the Obsidian Web Clipper library). Drops nav/sidebars/ads, ~47% fewer tokens on docs pages
 - `summary` subagent - pass `summary: true`, get only a concise summary of the whole page back (the full page never enters your chat context). Reuses your current Pi model by default, no setup needed
@@ -21,7 +22,7 @@ Inspired by the [ds4-agent](https://github.com/antirez/ds4) approach by @antirez
 
 ## How it works
 
-When you call `google_search`, `google_image_search`, or `visit_page`:
+When you call `google_search`, `google_image_search`, `google_search_by_image`, or `visit_page`:
 - A visible Chrome window opens (not headless) with a dedicated profile at `~/.pi-search-browser/`
 - Chrome DevTools Protocol (CDP) is used to navigate and extract content
 - JavaScript runs in the page to extract readable markdown - site-specific extractors for X, Reddit, Amazon, Scholar. [Defuddle](https://github.com/kepano/defuddle) reader-mode for `clean`. Generic pages come back as main text plus images and navigation links
@@ -84,6 +85,47 @@ known) the image size:
   top results are more likely to come back at full resolution.
 - Like the other tools it uses your visible Chrome, so it sees the same Google
   session (consent, language, region, proxy) as `google_search`.
+
+### `google_search_by_image`
+
+Reverse image search: upload a local image file to Google Lens and get back
+where it appears. `mode` is required - the agent has to choose what it wants:
+
+- `mode: "exact"` - pages that show the same image. Use it to find the
+  original page, credits, or other places the image is reused.
+- `mode: "visual"` - visually similar images and the pages they appear on.
+  Use it to find lookalikes, related photos, products, or the likely subject.
+
+```
+google_search_by_image({ path: "screenshots/header.png", mode: "exact" })
+google_search_by_image({ path: "~/Downloads/photo.jpg", mode: "visual" })
+```
+
+Every result carries the page URL, the source site, and (for visual matches,
+when Google exposes one) the matched image URL:
+
+```
+1. [Noemys Viviers-du-lac, Viviers-du-lac (updated prices 2027)](https://www.booking.com/hotel/fr/hotel-le-clos-du-lac.html)
+   source: Booking.com
+2. [View of the Lake Lugano promenade - Komoot](https://www.komoot.com/smarttour/24899533)
+   source: Komoot
+```
+
+- The path resolves like Pi's read tool: absolute, relative to the working
+  directory, or `~/...`. PNG, JPEG, GIF, WebP and BMP up to 20 MB are accepted.
+  The file is checked by its signature before anything is uploaded.
+- The upload goes through Lens's own file input in the visible Chrome, so it
+  carries the real browser's cookies, user agent and proxy. The mode is
+  Google's own result tab (`udm=48` exact, `udm=44` visual).
+- Page links are Google `/goto?url=` wrappers and are resolved to the real pages
+  by following the redirect inside the same tab, exactly like `google_search`.
+  A link that cannot be resolved is kept as-is so it is still visitable.
+- The bot-check handling from `visit_page` applies here too: a challenge page is
+  waited out (and clicked if it needs a gesture), and a CAPTCHA is reported
+  instead of being returned as results.
+- Results are capped at the top 12 per mode. Exact matches are pages (every one
+  shows the uploaded image, so no per-result image URL). Visual matches include
+  the matched image URL when available.
 
 ### `visit_page`
 
@@ -283,7 +325,7 @@ These used to come back as short, plausible-looking "content". Now:
   the widget's box - including inside a *closed shadow root*, which only CDP's
   DOM domain can see - and dispatches a real mouse move + click at the
   checkbox, then at the widget centre if the first click did not take. This is
-  the same approach FlareSolverr and nodriver use for Cloudflare; no extra
+  the same approach FlareSolverr and nodriver use for Cloudflare. No extra
   service or dependency. CAPTCHA *solving* is out of scope by design.
 - CAPTCHA gates (a `reCAPTCHA`/`hCaptcha`/Turnstile widget plus gate
   wording such as "Verify you are human" or "Login To Skip This Step", e.g.
@@ -564,7 +606,7 @@ pnpm install
 pnpm test
 ```
 
-Eight layers of tests (163 total):
+Nine layers of tests (178 total):
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
 - `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget. Client-side redirects are waited out (`waitForSettledDocument`), the pre-scroll extraction is kept when the page navigates away mid-visit, a tab that lands on Chrome's error page re-navigates once, and specialized extractors still run exactly once. The wall/download paths are covered too: a bot-check page that clears is extracted after the tab is activated, one that does not returns a `__BLOCKED__: challenge` marker (likewise `captcha` and `login`), a visible bot-check widget is clicked at the checkbox coordinates (then at the widget centre) and an off-screen duplicate is ignored, no click happens for a JavaScript-only challenge, a text download is read through a same-origin `fetch()` and returned fenced (base64 decoded), a binary download is reported, and a host/path-changing redirect adds a `> Redirected:` line.
@@ -572,6 +614,7 @@ Eight layers of tests (163 total):
 - `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.
 - `tests/unit/image-search.test.ts` - covers Google Images: `clampImageCount` (default, floors, clamps, non-numbers) and the generated extractor (`getGoogleImageSearchJs`) - it parses as JavaScript, embeds the clamped count, keeps the DOM contract it depends on (data-lpage tiles, the preview image selector, gstatic detection, the `(google-cached)` marker, and both the image and page URL lines), and bounds its own runtime against the CDP timeout. No browser, no network.
+- `tests/unit/reverse-image.test.ts` - covers `google_search_by_image`'s pure parts: path resolution (absolute, cwd-relative, `~`), image signature sniffing (PNG/JPEG/GIF/WebP/BMP and rejections), `readImageFile` (missing/empty/non-file/non-image errors), the 20 MB limit, the exact/visual mode helpers, and the generated extractor for both modes (parses, differs per mode, keeps the Lens/web/grid card selectors, caps results, emits absolute page links for the redirect resolver). No browser, no network.
 - `tests/unit/wall.test.ts` - table-driven tests for `classifyWall`, the pure function behind wall detection: a bot-check interstitial served with 200 (Fastly "Client Challenge", Cloudflare "Just a moment..."), a CAPTCHA gate, a login form, a JavaScript shell ("Loading..."), and the negative cases that must stay content (a long article mentioning "Access Denied", a contact page with a reCAPTCHA, a page that merely embeds a Turnstile widget, an image-only gallery, an image URL with no scripts, a short static page).
 
 ### Type-checking

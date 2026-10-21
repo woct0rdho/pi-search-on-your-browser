@@ -9,9 +9,9 @@
 // Cookies and sessions persist across calls.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 import { resolveConfig } from "./subagent.ts";
 import { resolveGoogleRedirectsInBrowser } from "./google-links.ts";
@@ -21,6 +21,10 @@ import {
   GOOGLE_SEARCH_JS,
   getGoogleImageSearchJs,
   clampImageCount,
+  getReverseImageSearchJs,
+  isReverseImageMode,
+  REVERSE_IMAGE_MODES,
+  type ReverseImageMode,
   EXTRACT_PAGE_JS,
   X_EXTRACT_JS,
   REDDIT_EXTRACT_JS,
@@ -1714,6 +1718,237 @@ export async function googleImageSearch(
       waitForTimeoutMs: 10_000,
       initialWaitMs: 1000,
     });
+}
+
+export interface ReverseImageSearchOptions {
+  mode: ReverseImageMode;
+  onStatus?: (msg: string) => void;
+}
+
+// Largest upload Google Lens accepts (the UI rejects bigger files).
+export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+// Resolve a read-tool-style path: absolute, relative to the cwd, or `~/...`.
+export function resolveImagePath(input: string): string {
+  const trimmed = (input ?? "").trim();
+  if (!trimmed) throw new Error("An image path is required.");
+  const expanded =
+    trimmed === "~" || trimmed.startsWith("~/") || trimmed.startsWith("~\\")
+      ? join(homedir(), trimmed.slice(1))
+      : trimmed;
+  return isAbsolute(expanded) ? expanded : resolve(process.cwd(), expanded);
+}
+
+// MIME type from the file signature (what Lens accepts), or undefined.
+export function sniffImageMime(head: Buffer): string | undefined {
+  const ascii = (from: number, to: number) => head.subarray(from, to).toString("latin1");
+  if (head.length >= 8 && head[0] === 0x89 && ascii(1, 4) === "PNG" && head[4] === 0x0d && head[5] === 0x0a) {
+    return "image/png";
+  }
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return "image/jpeg";
+  if (head.length >= 6 && (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a")) return "image/gif";
+  if (head.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return "image/webp";
+  if (head.length >= 2 && ascii(0, 2) === "BM") return "image/bmp";
+  return undefined;
+}
+
+export interface LocalImage {
+  // Absolute path, as Chrome's file-input API needs it.
+  path: string;
+  // Base name, for messages and tool output.
+  name: string;
+  mime: string;
+  size: number;
+}
+
+// Validate a local image the way Pi's read tool resolves paths, before Chrome
+// is touched: it must exist, be a regular file, fit Lens's upload limit, and
+// actually be an image (sniffed, not trusted from the extension).
+export function readImageFile(input: string): LocalImage {
+  const path = resolveImagePath(input);
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(path);
+  } catch {
+    throw new Error(`Image not found: ${path}`);
+  }
+  if (!stat.isFile()) throw new Error(`Not a regular file: ${path}`);
+  if (stat.size === 0) throw new Error(`Image is empty: ${path}`);
+  if (stat.size > MAX_IMAGE_BYTES) {
+    const mb = (stat.size / (1024 * 1024)).toFixed(1);
+    throw new Error(`Image is too large (${mb} MB); Google Lens accepts up to ${MAX_IMAGE_BYTES / (1024 * 1024)} MB`);
+  }
+
+  const head = Buffer.alloc(16);
+  const fd = openSync(path, "r");
+  try {
+    readSync(fd, head, 0, head.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const mime = sniffImageMime(head);
+  if (!mime) {
+    throw new Error(`Unsupported image format: ${path} (expected PNG, JPEG, GIF, WebP, or BMP)`);
+  }
+  return { path, name: basename(path), mime, size: stat.size };
+}
+
+// Poll an in-page boolean expression until it is true or the timeout expires.
+// Evaluation errors are expected while the page navigates (the execution
+// context is destroyed) and are treated as "not yet".
+async function waitForPageCondition(cdp: CDPLike, expression: string, timeoutMs: number, pollMs = 300): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if ((await cdp.evaluate(expression)) === "true") return true;
+    } catch {
+      // navigation in progress
+    }
+    await sleep(pollMs);
+  }
+  return false;
+}
+
+// Current tab URL, or "" while the page is navigating.
+async function currentPageUrl(cdp: CDPLike): Promise<string> {
+  try {
+    return await cdp.evaluate("location.href");
+  } catch {
+    return "";
+  }
+}
+
+// Absolute href of the "Exact matches" / "Visual matches" tab, if rendered.
+async function reverseImageModeHref(cdp: CDPLike, mode: ReverseImageMode): Promise<string> {
+  const label = mode === "exact" ? "Exact matches" : "Visual matches";
+  try {
+    return await cdp.evaluate(
+      `(() => {
+        const clean = s => (s || "").replace(/\\s+/g, " ").trim();
+        const a = [...document.querySelectorAll("a")].find((x) => clean(x.innerText) === ${JSON.stringify(label)});
+        return a ? a.href : "";
+      })()`,
+    );
+  } catch {
+    return "";
+  }
+}
+
+// Add/replace the mode parameter on a Lens results URL (fallback for when the
+// tab link has not rendered yet).
+function withReverseImageMode(url: string, mode: ReverseImageMode): string | undefined {
+  try {
+    const u = new URL(url);
+    u.searchParams.set("udm", mode === "exact" ? "48" : "44");
+    return u.href;
+  } catch {
+    return undefined;
+  }
+}
+
+// Google search by image: upload a local file to Lens, then read the results
+// for the chosen mode (exact matches = pages with the same image. Visual
+// matches = visually similar images). The upload goes through Lens's own file
+// input, so the request carries the real browser's cookies, user agent and
+// proxy. The mode switch uses the same tab and Google's own tab links.
+export async function reverseImageSearch(
+  filePath: string,
+  options: ReverseImageSearchOptions,
+): Promise<SearchResult> {
+  const status = options.onStatus ?? (() => {});
+  const mode = options.mode;
+  if (!isReverseImageMode(mode)) {
+    throw new Error(`Invalid mode "${String(mode)}" - use ${REVERSE_IMAGE_MODES.map((m) => `"${m}"`).join(" or ")}.`);
+  }
+  const image = readImageFile(filePath);
+
+  await ensureChrome(status);
+  const tab = await openTab();
+  const cdp = new CDPClient();
+  await cdp.connect(tab.wsUrl);
+
+  try {
+    await cdp.call("Page.enable");
+    await cdp.call("Runtime.enable");
+    await cdp.call("Network.enable");
+    // Uploading and previewing need an active tab, like the scrolling paths.
+    await cdp.call("Page.bringToFront");
+
+    status("Opening Google Lens...");
+    await cdp.call("Page.navigate", { url: "https://lens.google.com/" });
+    await sleep(1500);
+
+    // Consent / bot-check walls on the Lens entry page.
+    try {
+      const consent = await cdp.evaluate(GOOGLE_CONSENT_JS);
+      if (consent) status(`Consent: ${consent}`);
+    } catch {
+      // not a consent page
+    }
+    if (await probeWall(cdp)) {
+      status("Google is showing a check page - waiting for it to clear...");
+      await waitForChallengeToClear(cdp, {
+        timeoutMs: WALL_WAIT_MS,
+        onStatus: status,
+        reloadAfterMs: CHALLENGE_RELOAD_AFTER_MS,
+        isCleared: async () => !(await probeWall(cdp)),
+      });
+    }
+
+    status("Waiting for the upload control...");
+    if (!(await waitForPageCondition(cdp, `document.querySelector('input[type=file]') !== null`, 20_000))) {
+      throw new Error("Google Lens did not show its upload control (the page may be blocked or waiting on consent).");
+    }
+
+    status(`Uploading ${image.name}...`);
+    const doc = (await cdp.call("DOM.getDocument", { depth: -1 })) as { root: { nodeId: number } };
+    const node = (await cdp.call("DOM.querySelector", { nodeId: doc.root.nodeId, selector: "input[type=file]" })) as {
+      nodeId: number;
+    };
+    if (!node || !node.nodeId) throw new Error("Google Lens upload input was not found.");
+    await cdp.call("DOM.setFileInputFiles", { files: [image.path], nodeId: node.nodeId });
+
+    status("Waiting for Google's image analysis...");
+    if (!(await waitForPageCondition(cdp, `/\\/search\\?vsrid=/.test(location.href)`, 45_000, 500))) {
+      throw new Error("Google did not return a results page for the uploaded image.");
+    }
+
+    status(`Switching to ${mode === "exact" ? "exact" : "visual"} matches...`);
+    // Setting `udm` on the results URL is what the mode tabs do. The tab href
+    // carries short-lived session params and sometimes lands back on "All",
+    // so it is only a fallback.
+    const target = withReverseImageMode(await currentPageUrl(cdp), mode) || (await reverseImageModeHref(cdp, mode));
+    if (target) {
+      await cdp.call("Page.navigate", { url: target });
+      await waitForPageCondition(cdp, `document.readyState === "complete"`, 20_000);
+      await sleep(2000);
+    }
+
+    status("Waiting for results...");
+    // Visual matches render as Lens cards. Exact matches as result cards (an
+    // image grid or ordinary web results).
+    const resultSelector =
+      mode === "visual"
+        ? "a.LBcIee"
+        : 'a[href*="/goto?url="]';
+    await waitForPageCondition(
+      cdp,
+      `document.querySelectorAll(${JSON.stringify(resultSelector)}).length > 0`,
+      30_000,
+      400,
+    );
+    await sleep(1500);
+
+    status("Extracting results...");
+    let markdown = await cdp.evaluate(getReverseImageSearchJs(mode));
+    // Result links are /goto?url=<opaque> wrappers: resolve them to the real
+    // pages by following the 302 inside this tab, like google_search does.
+    markdown = await resolveGoogleRedirectsInBrowser(cdp, markdown, { onStatus: status });
+    return { markdown, url: await currentPageUrl(cdp) };
+  } finally {
+    cdp.disconnect();
+    await closeTab(tab.targetId);
+  }
 }
 
 // If the extraction returned an HTTP-error marker (set by runInPageSession
