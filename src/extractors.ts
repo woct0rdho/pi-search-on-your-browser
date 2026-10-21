@@ -916,3 +916,162 @@ export function isScholarSearchUrl(url: string): boolean {
     return false;
   }
 }
+
+// Page-state probes: is this page a wall instead of content?
+//
+// A page can answer 200 and still not carry the content: Fastly's "Client
+// Challenge" (pypi.org), Cloudflare's "Just a moment...", a reCAPTCHA gate
+// (jbovlaste.lojban.org), a login form, or a JavaScript shell that still says
+// "Loading...". These probes feed classifyWall(), which is a pure function so
+// the rules stay testable without a browser.
+
+export interface WallState {
+  href: string;
+  title: string;
+  // Visible text length.
+  len: number;
+  // First 240 characters of visible text.
+  head: string;
+  captcha: boolean;
+  // A password field that is actually laid out (a hidden login modal in a
+  // page's header must not look like a login wall).
+  password: boolean;
+  scripts: number;
+  // Number of <img> elements: an image-only page has no text but is content. *
+  images: number;
+}
+
+export type WallKind = "challenge" | "captcha" | "login" | "shell";
+
+// Title of bot-check interstitials, anchored: a real page titled "Access
+// Denied: ..." must not look like a JavaScript challenge.
+const WALL_TITLE_RE =
+  /^(just a moment|client challenge|attention required|access denied|checking your browser|verifying your browser|please wait|请稍候|人机验证|安全验证|环境异常|アクセスが制限)/i;
+
+// Body text that only appears on bot-check interstitials.
+const WALL_BODY_RE =
+  /client challenge|checking your browser|verifying your browser|checking if the site connection is secure|enable javascript and cookies|ddos protection|verify (?:you are|you're) (?:a )?human|are you a robot|human verification|请稍候|人机验证|安全验证|环境异常|しばらくお待ちください|アクセスが制限/i;
+
+// "Still loading" placeholders of JavaScript app shells.
+const WALL_LOADING_RE =
+  /loading(\.\.\.|…)|please wait|読み込み中|読み込んでいます|加载中|正在加载|initiali[sz]ing(\.\.\.|…)|wird geladen/i;
+
+// Login-wall wording.
+const WALL_LOGIN_RE = /\b(log ?in|sign ?in|login|password|authenticate)\b|ログイン|パスワード|登录|密码|密碼/i;
+
+// Wording of a CAPTCHA gate. A page that merely embeds a Turnstile widget in
+// its own form (nowsecure.nl, contact pages) does not say any of this.
+const WALL_CAPTCHA_TEXT_RE =
+  /captcha|verify|verification|robot|human|security check|confirm you|log ?in|sign ?in|password|登录|验证|ログイン|認証/i;
+
+// Decide whether a page state is a wall and which kind. Deliberately
+// conservative: every rule needs a short page, so a long article that merely
+// mentions "Access Denied" or embeds a reCAPTCHA in a sidebar stays content.
+// `password` means a *laid-out* password field (the probe checks it), because
+// plenty of pages carry a hidden login modal in their header.
+export function classifyWall(state: WallState): WallKind | null {
+  if (state.captcha && state.len < 800 && WALL_CAPTCHA_TEXT_RE.test(`${state.title} ${state.head}`)) {
+    return "captcha";
+  }
+  if (state.len < 500 && (WALL_TITLE_RE.test(state.title.trim()) || WALL_BODY_RE.test(state.head))) {
+    return "challenge";
+  }
+  if (state.len <= 240 && WALL_LOADING_RE.test(state.head)) return "shell";
+  // No text at all and no images, but scripts: a shell that has not rendered.
+  // An image-only page (a gallery) is content, not a shell.
+  if (state.len < 40 && state.scripts > 0 && state.images === 0) return "shell";
+  if (state.password && state.len < 800 && WALL_LOGIN_RE.test(state.head)) return "login";
+  return null;
+}
+
+// One-shot page state probe used by classifyWall(). The `pi-wall` marker
+// lets the unit-test fake recognise the probe.
+export const WALL_PROBE_JS = `(() => {
+  /* pi-wall */
+  try {
+    const body = document.body;
+    const text = (body && body.innerText ? body.innerText : "").replace(/\\s+/g, " ").trim();
+    const has = s => { try { return Boolean(document.querySelector(s)); } catch (e) { return false; } };
+    const pw = document.querySelector("input[type=password]");
+    const pwVisible = Boolean(pw && (pw.getClientRects().length > 0 || pw.offsetParent !== null));
+    return JSON.stringify({
+      href: location.href,
+      title: (document.title || "").trim(),
+      len: text.length,
+      head: text.slice(0, 240),
+      captcha: has(".g-recaptcha,[data-sitekey],.cf-turnstile,.h-captcha,iframe[src*='recaptcha'],iframe[src*='hcaptcha']"),
+      password: pwVisible,
+      scripts: document.scripts.length,
+      images: document.images.length
+    });
+  } catch (e) {
+    return JSON.stringify({ error: String((e && e.message) || e) });
+  }
+})()`;
+
+// Visible iframe/frame geometry, for locating a bot-check widget (Turnstile,
+// reCAPTCHA, ...) that must be clicked. Only the light DOM is reachable from
+// here - Cloudflare nests its iframe in a closed shadow root, which the DOM
+// domain walk in findChallengeWidget() handles instead.
+export const WIDGET_RECTS_JS = `(() => {
+  /* pi-widget */
+  const out = [];
+  try {
+    for (const f of document.querySelectorAll("iframe, frame")) {
+      const r = f.getBoundingClientRect();
+      const s = getComputedStyle(f);
+      if (r.width < 20 || r.height < 10 || s.visibility === "hidden" || s.display === "none") continue;
+      out.push({
+        src: (f.getAttribute("src") || "") + " " + (f.getAttribute("title") || ""),
+        x: r.left,
+        y: r.top,
+        w: r.width,
+        h: r.height
+      });
+    }
+  } catch (e) {
+    // Return what was collected.
+  }
+  return JSON.stringify(out);
+})()`;
+
+// Read a URL that Chrome turned into a download. Runs on a page of the same
+// origin (about:blank has an opaque origin, so fetch() from there is
+// cross-origin and CORS-blocked). fetch() itself ignores
+// `Content-Disposition: attachment` and returns the bytes, with the browser's
+// cookies, TLS and proxy. Base64 bodies (Gitiles `?format=TEXT`, many APIs)
+// are decoded when they are valid UTF-8 text.
+export function downloadFetchJs(target: string): string {
+  return `(async () => {
+  /* pi-download */
+  const cap = 400000;
+  try {
+    const r = await fetch(${JSON.stringify(target)});
+    const buf = await r.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const total = bytes.length;
+    const slice = bytes.subarray(0, cap);
+    const text = new TextDecoder("utf-8").decode(slice);
+    let bad = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      if (c === 0xfffd || (c < 32 && c !== 9 && c !== 10 && c !== 13)) bad++;
+    }
+    let decoded = "";
+    const compact = text.replace(/\\s+/g, "");
+    if (compact.length > 40 && compact.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+      try {
+        const bin = atob(compact);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        decoded = new TextDecoder("utf-8", { fatal: true }).decode(u8);
+      } catch (e) {
+        decoded = "";
+      }
+    }
+    return JSON.stringify({ status: r.status, ct: r.headers.get("content-type") || "", total, truncated: total > cap, bad, text, decoded });
+  } catch (e) {
+    return JSON.stringify({ error: String((e && e.message) || e) });
+  }
+})()`;
+}

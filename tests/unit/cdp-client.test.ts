@@ -73,6 +73,21 @@ class FakeCDP implements CDPLike {
   settleStates: string[] = [];
   // Every pi-settle probe response the session saw.
   settleProbes: string[] = [];
+  // Queued WALL_PROBE_JS responses (JSON). Shifted per call. The default is a
+  // normal content page.
+  wallStates: string[] = [];
+  wallProbes: string[] = [];
+  // WIDGET_RECTS_JS response: JSON array of visible iframe boxes. Empty means
+  // no bot-check widget is on the page.
+  widgetRects = "[]";
+  // Page.navigate reports isDownload - Chrome turns Content-Disposition:
+  // attachment responses into downloads and never commits a document. Only the
+  // next navigation is a download (a real download URL is followed by the
+  // origin page the file is read from).
+  navigateIsDownload = false;
+  private lastWallState?: string;
+  // JSON returned by downloadFetchJs().
+  downloadResult = JSON.stringify({ status: 200, ct: "text/plain", total: 120, bad: 0, text: "hello from the downloaded file" });
   private loadHandlers: Array<(params: unknown) => void> = [];
   private networkHandlers: Array<(params: unknown) => void> = [];
   private frameHandlers: Array<(params: unknown) => void> = [];
@@ -134,8 +149,13 @@ class FakeCDP implements CDPLike {
       }
       if (method === "Page.navigate") {
         // Fire load handlers synchronously (registered before navigate).
-        if (!this.noLoadEvent) for (const h of this.loadHandlers) h({});
+        const isDownload = this.navigateIsDownload;
+        this.navigateIsDownload = false;
+        if (!isDownload && !this.noLoadEvent) {
+          for (const h of this.loadHandlers) h({});
+        }
         if (this.navigateHangs) return new Promise<never>(() => {});
+        return { isDownload };
       }
       return {};
     }
@@ -145,10 +165,31 @@ class FakeCDP implements CDPLike {
   async evaluate(expression: string): Promise<string> {
     this.evaluations.push(expression);
     // waitForSettledDocument's probe (marked so the fake can find it).
-    if (expression.includes("/*pi-settle*/")) {
+    if (expression.includes("/* pi-settle */")) {
       const state = this.settleStates.shift() ?? "body|complete|1000|https://example.com/page";
       this.settleProbes.push(state);
       return state;
+    }
+    // WALL_PROBE_JS (page-state probe used by probeWall).
+    if (expression.includes("/* pi-wall */")) {
+      const next = this.wallStates.shift();
+      if (next !== undefined) {
+        this.lastWallState = next;
+      }
+      const state =
+        next ??
+        this.lastWallState ??
+        JSON.stringify({ href: "https://example.com/page", title: "", len: 1000, head: "content", captcha: false, password: false, scripts: 1 });
+      this.wallProbes.push(state);
+      return state;
+    }
+    // downloadFetchJs (reads a downloaded file through a same-origin fetch).
+    if (expression.includes("/* pi-download */")) {
+      return this.downloadResult;
+    }
+    // WIDGET_RECTS_JS (visible iframe geometry for bot-check widgets).
+    if (expression.includes("/* pi-widget */")) {
+      return this.widgetRects;
     }
     // waitForSelector polls look like: document.querySelector("...") !== null
     // cdp.evaluate stringifies the boolean -> "true" / "false" (the bug source).
@@ -598,7 +639,7 @@ test("a transient 502 is retried once and then extracted", async () => {
   );
   // A gateway error page is not a bot check: no challenge probe needed.
   assert.ok(
-    !fake.evaluations.some((e) => e.includes("document.title")),
+    !fake.evaluations.some((e) => e.startsWith("(document.title")),
     "must not probe for challenge markers on a 502",
   );
 });
@@ -996,8 +1037,11 @@ test("a mirror redirect is not a hijack", async () => {
 
   const result = await runInPageSession(fake, baseOpts({ js: "extractor()", safetyExtract: true }));
 
-  assert.ok(result.startsWith("REAL CONTENT:"), `expected the post-scroll copy, got: ${result}`);
+  assert.ok(result.includes("REAL CONTENT:"), `expected the post-scroll copy, got: ${result}`);
 });
+
+// A 200 page can be a wall instead of content (bot check, CAPTCHA, login,
+// JavaScript shell) - handled in the wall tests below.
 
 test("prefers the post-scroll extraction when the page stayed", async () => {
   const fake = new FakeCDP();
@@ -1018,6 +1062,224 @@ test("extracts once unless the safety pass is requested", async () => {
     1,
     "specialized extractors scroll themselves and must not run twice",
   );
+});
+
+// Page walls: bot-check interstitials served with 200, CAPTCHA and login
+// gates, JavaScript shells, and file downloads.
+
+const WALL_CHALLENGE = JSON.stringify({
+  href: "https://example.com/page",
+  title: "Client Challenge",
+  len: 0,
+  head: "",
+  captcha: false,
+  password: false,
+  scripts: 2,
+});
+const WALL_CONTENT = JSON.stringify({
+  href: "https://example.com/page",
+  title: "The page",
+  len: 2000,
+  head: "real page text",
+  captcha: false,
+  password: false,
+  scripts: 3,
+});
+
+test("a 200 bot-check page is waited out and then extracted", async () => {
+  const fake = new FakeCDP();
+  // Challenge, still challenging, then the real page.
+  fake.wallStates = [WALL_CHALLENGE, WALL_CHALLENGE, WALL_CONTENT];
+
+  const result = await runInPageSession(
+    fake,
+    baseOpts({ js: "extractor()", wallWaitMs: 2_000 }),
+  );
+
+  assert.equal(result, "extracted content");
+  assert.ok(fake.wallProbes.length >= 2, "kept probing while the check ran");
+  assert.ok(
+    fake.calls.some((c) => c.method === "Page.bringToFront"),
+    "the tab must be activated for the challenge script to run",
+  );
+});
+
+test("a bot-check page that never clears is reported, not extracted", async () => {
+  const fake = new FakeCDP();
+  fake.wallStates = [WALL_CHALLENGE];
+
+  const result = await runInPageSession(
+    fake,
+    baseOpts({ js: "extractor()", wallWaitMs: 50 }),
+  );
+
+  assert.ok(result.startsWith("__BLOCKED__: challenge: "), `expected a challenge marker, got: ${result}`);
+  assert.ok(result.includes("Client Challenge"), "the marker names what was on the page");
+  assert.ok(!fake.evaluations.includes("extractor()"), "nothing to extract from the challenge");
+});
+
+test("a CAPTCHA gate is reported immediately", async () => {
+  const fake = new FakeCDP();
+  fake.wallStates = [JSON.stringify({
+    href: "https://example.com/export",
+    title: "",
+    len: 25,
+    head: "Login To Skip This Step",
+    captcha: true,
+    password: false,
+    scripts: 1,
+  })];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 5_000 }));
+
+  assert.ok(result.startsWith("__BLOCKED__: captcha: "), `expected captcha marker, got: ${result}`);
+  assert.ok(!fake.evaluations.includes("extractor()"));
+});
+
+test("a JavaScript shell is waited out and then extracted", async () => {
+  const fake = new FakeCDP();
+  fake.wallStates = [
+    JSON.stringify({ href: "https://example.com/en", title: "App", len: 36, head: "Menu Loading...", captcha: false, password: false, scripts: 4 }),
+    WALL_CONTENT,
+  ];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 2_000 }));
+
+  assert.equal(result, "extracted content");
+  assert.ok(fake.wallProbes.length >= 2, "kept probing until the app rendered");
+});
+
+test("a bot-check widget is clicked like a user would", async () => {
+  const fake = new FakeCDP();
+  // Challenge first, then the real page once the checkbox is clicked. The
+  // click only happens after ~1.2s of challenge, so keep it challenging for a
+  // few polls.
+  fake.wallStates = [
+    WALL_CHALLENGE,
+    WALL_CHALLENGE,
+    WALL_CHALLENGE,
+    WALL_CHALLENGE,
+    WALL_CHALLENGE,
+    WALL_CONTENT,
+  ];
+  fake.widgetRects = JSON.stringify([
+    {
+      src: "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile",
+      x: 100,
+      y: 200,
+      w: 300,
+      h: 65,
+    },
+    // An off-screen duplicate must not be the one that gets clicked.
+    { src: "https://challenges.cloudflare.com/cdn-cgi/challenge-platform", x: 0, y: -500, w: 300, h: 65 },
+  ]);
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 5_000 }));
+
+  assert.equal(result, "extracted content");
+  const pressed = fake.calls.filter((c) => c.method === "Input.dispatchMouseEvent" && c.params?.type === "mousePressed");
+  assert.equal(pressed.length, 2, `expected two attempts (checkbox, then centre): ${JSON.stringify(pressed)}`);
+  // First attempt: the checkbox at the left edge of the widget, vertically centred.
+  assert.equal(pressed[0].params?.x, 128);
+  assert.equal(pressed[0].params?.y, 233);
+  // Second attempt: the widget centre, in case the checkbox is elsewhere.
+  assert.equal(pressed[1].params?.x, 250);
+  assert.equal(pressed[1].params?.y, 233);
+  assert.ok(
+    fake.calls.some((c) => c.method === "Input.dispatchMouseEvent" && c.params?.type === "mouseMoved"),
+    "a mouse move precedes the click like a real gesture",
+  );
+});
+
+test("no click happens when the challenge page has no widget", async () => {
+  const fake = new FakeCDP();
+  fake.wallStates = [WALL_CHALLENGE, WALL_CONTENT];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 2_000 }));
+
+  assert.equal(result, "extracted content");
+  assert.equal(
+    fake.calls.filter((c) => c.method === "Input.dispatchMouseEvent").length,
+    0,
+    "a JavaScript-only challenge must not be clicked",
+  );
+});
+
+// Downloads: Chrome never commits a document (the tab stays on about:blank),
+// so the bytes are read through a same-origin fetch instead.
+
+test("a text download is returned as fenced content", async () => {
+  const fake = new FakeCDP();
+  fake.navigateIsDownload = true;
+  fake.downloadResult = JSON.stringify({
+    status: 200,
+    ct: "text/plain; charset=utf-8",
+    total: 120,
+    bad: 0,
+    text: "hello from the downloaded file",
+  });
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.ok(result.includes("hello from the downloaded file"), `content missing: ${result}`);
+  assert.ok(result.includes("## Content"));
+  assert.ok(/file download \(text\/plain, 120 bytes\)/.test(result), `note missing: ${result}`);
+  assert.ok(!fake.evaluations.includes("extractor()"), "no extractor on an about:blank tab");
+});
+
+test("a base64 download is decoded", async () => {
+  const fake = new FakeCDP();
+  fake.navigateIsDownload = true;
+  fake.downloadResult = JSON.stringify({
+    status: 200,
+    ct: "text/plain; charset=utf-8",
+    total: 64,
+    bad: 0,
+    text: "aGVsbG8gZGVjb2RlZA==",
+    decoded: "hello decoded",
+  });
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.ok(result.includes("hello decoded"), `decoded text missing: ${result}`);
+  assert.ok(result.includes("base64-encoded"), `decode note missing: ${result}`);
+});
+
+test("a binary download is reported, not returned as text", async () => {
+  const fake = new FakeCDP();
+  fake.navigateIsDownload = true;
+  fake.downloadResult = JSON.stringify({
+    status: 200,
+    ct: "application/zip",
+    total: 3_400_000,
+    bad: 40_000,
+    text: "PK\u0003\u0004\u0000\u0000garbage",
+  });
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.ok(result.startsWith("__BLOCKED__: download: "), `expected download marker, got: ${result}`);
+  assert.ok(result.includes("application/zip"), `content type missing: ${result}`);
+});
+
+// Redirects: say when the tab ended up on a different page shape.
+
+test("a host/path-changing redirect is reported in the output", async () => {
+  const fake = new FakeCDP();
+  fake.locationHrefs = ["https://t.me/lojban"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.ok(result.startsWith("> Redirected: https://example.com/page -> https://t.me/lojban"), result.slice(0, 160));
+});
+
+test("mode-only URL differences are not reported as redirects", async () => {
+  const fake = new FakeCDP();
+  fake.locationHrefs = ["https://www.example.com/page/"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.equal(result, "extracted content");
 });
 
 // Chrome launch flags (keep renderer alive in background)

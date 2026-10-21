@@ -34,6 +34,12 @@ import {
   isAmazonProductUrl,
   isAmazonSearchUrl,
   isScholarSearchUrl,
+  WALL_PROBE_JS,
+  classifyWall,
+  type WallKind,
+  type WallState,
+  WIDGET_RECTS_JS,
+  downloadFetchJs,
 } from "./extractors.ts";
 
 const PROFILE_DIR = join(homedir(), ".pi-search-browser");
@@ -63,7 +69,7 @@ export const NAVIGATE_ATTEMPTS = 3;
 // the real document a few seconds later. Measured on a fresh profile through
 // a proxy: 403 at ~3.2s, self-reload to 200 at ~7.6s. An ordinary browser
 // never surfaces that first response - it only shows the final page.
-export const INTERSTITIAL_WAIT_MS = 15_000;
+export const INTERSTITIAL_WAIT_MS = 30_000;
 // After `Page.reload` on a non-challenge 403/503 (the F5 move), how long to
 // wait for the retried document response before giving up.
 export const INTERSTITIAL_RELOAD_WAIT_MS = 8_000;
@@ -76,6 +82,19 @@ const INTERSTITIAL_POLL_MS = 300;
 // mistaken for a solvable challenge.
 export const CHALLENGE_PAGE_RE =
   /just a moment|attention required|checking (?:your browser|if the site)|verify (?:you are|you're|that you are) (?:a )?human|are you a robot|access to this page has been denied|request unsuccessful|enable javascript and cookies|ddos protection|under attack|incapsula|datadome|perimeterx|please wait while we (?:verify|check)/i;
+
+// How long a wall (challenge page, JavaScript shell) gets to render itself
+// after the tab is activated. Measured through the proxy: pypi.org's Fastly
+// challenge renders at ~6s, lensisku.lojban.org's SPA at ~4s, Cloudflare's
+// "Just a moment..." at ~10s. An interactive Turnstile checkbox needs the
+// click below.
+export const WALL_WAIT_MS = 30_000;
+const WALL_POLL_MS = 500;
+// A challenge that has not cleared by then gets one reload - Cloudflare's
+// script occasionally stalls waiting for a fresh document.
+const CHALLENGE_RELOAD_AFTER_MS = 12_000;
+// Poll interval of the challenge wait.
+const CHALLENGE_POLL_MS = 400;
 
 // Probe evaluated on a 403/503 to tell a solvable interstitial from a plain
 // denial. Cheap (title + first 400 chars of visible text).
@@ -655,6 +674,10 @@ interface RunInPageOptions {
   // Used by visit_page's generic extraction. The specialized extractors wait
   // for their own selectors instead.
   contentFirst?: boolean;
+  // How long a detected wall (bot-check interstitial, JavaScript app shell)
+  // gets to render itself after the tab is activated. 0 disables the wait
+  // (tests). Default WALL_WAIT_MS.
+  wallWaitMs?: number;
   onStatus: (msg: string) => void;
 }
 
@@ -672,12 +695,16 @@ async function navigateToPage(
   url: string,
   pageLoaded: Promise<void>,
   onStatus: StatusFn,
-): Promise<void> {
+): Promise<{ isDownload: boolean }> {
   let lastError: Error | undefined;
 
   for (let attempt = 1; attempt <= NAVIGATE_ATTEMPTS; attempt++) {
+    let navigateResult: { isDownload?: boolean } | undefined;
     const outcome = cdp.call("Page.navigate", { url }, NAVIGATE_TIMEOUT_MS).then(
-      () => "done" as const,
+      (res) => {
+        navigateResult = res as { isDownload?: boolean };
+        return "done" as const;
+      },
       (err: unknown) => {
         const e = err instanceof Error ? err : new Error(String(err));
         if (!/timeout/i.test(e.message)) throw e;
@@ -690,7 +717,12 @@ async function navigateToPage(
     outcome.catch(() => {});
 
     const winner = await Promise.race([outcome, pageLoaded.then(() => "loaded" as const)]);
-    if (winner !== "timeout") return;
+    if (winner !== "timeout") {
+      // A `Content-Disposition: attachment` response turns the navigation into
+      // a download: Chrome never commits a document, the tab stays on
+      // about:blank and the load event never fires. Page.navigate reports it.
+      return { isDownload: Boolean(navigateResult?.isDownload) };
+    }
 
     if (attempt < NAVIGATE_ATTEMPTS) {
       onStatus(`Navigation is slow - retrying (${attempt + 1}/${NAVIGATE_ATTEMPTS})...`);
@@ -715,16 +747,356 @@ async function looksLikeChallengePage(cdp: CDPLike): Promise<boolean> {
   }
 }
 
+interface WallInfo {
+  kind: WallKind;
+  // Short, human-readable thing that was on the page ("Client Challenge").
+  detail: string;
+}
+
+// Read the page state once and decide whether it is a wall (challenge page,
+// CAPTCHA, login form, JavaScript shell) instead of content.
+async function probeWall(cdp: CDPLike): Promise<WallInfo | null> {
+  let state: WallState | undefined;
+  try {
+    state = parseWallState(String(await cdp.evaluate(WALL_PROBE_JS)));
+  } catch {
+    return null;
+  }
+  if (!state) return null;
+  const kind = classifyWall(state);
+  if (!kind) return null;
+  // A challenge names itself in the title ("Client Challenge"). A login form or
+  // a shell says more in its text ("Sign in to continue", "Loading...").
+  const preferText = kind === "login" || kind === "shell";
+  const raw = preferText ? state.head || state.title : state.title.length > 2 ? state.title : state.head;
+  const seen = raw.replace(/\s+/g, " ").trim();
+  return { kind, detail: `"${seen.slice(0, 120)}"` };
+}
+
+// Parse the JSON returned by WALL_PROBE_JS. Returns undefined for anything
+// unexpected so a broken probe never blocks a visit.
+function parseWallState(raw: string): WallState | undefined {
+  try {
+    const parsed = JSON.parse(raw) as Partial<WallState> & { error?: string };
+    if (parsed.error || typeof parsed.len !== "number" || typeof parsed.scripts !== "number") {
+      return undefined;
+    }
+    return {
+      href: String(parsed.href ?? ""),
+      title: String(parsed.title ?? ""),
+      len: Number(parsed.len),
+      head: String(parsed.head ?? ""),
+      captcha: Boolean(parsed.captcha),
+      password: Boolean(parsed.password),
+      scripts: Number(parsed.scripts),
+      images: Number(parsed.images ?? 0),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+// Bot-check widgets (Turnstile, reCAPTCHA, hCaptcha, ...)
+//
+// Mostly the challenge scripts solve themselves and only need a visible tab and
+// a few seconds. When the site escalates to the interactive variant ("Verify
+// you are human" checkbox), a human gesture is required - a click at the right
+// coordinates. The widget usually lives in a cross-origin iframe inside a
+// closed shadow root, so it cannot be reached from page JavaScript. CDP's DOM
+// domain can see through both, and Input events land wherever the coordinates
+// point regardless of origins.
+
+const WIDGET_SRC_RE =
+  /challenge|turnstile|recaptcha|hcaptcha|captcha|datadome|px-captcha|perimeterx|imperva/i;
+
+interface WidgetBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface DomNodeLike {
+  nodeName?: string;
+  nodeId?: number;
+  attributes?: string[];
+  children?: DomNodeLike[];
+  shadowRoots?: DomNodeLike[];
+  contentDocument?: DomNodeLike;
+}
+
+// Collect iframe/frame node ids whose src/title look like a bot-check widget,
+// walking shadow roots (including closed ones) and frame documents.
+function collectWidgetNodes(root: DomNodeLike | undefined, out: number[]): void {
+  if (!root || out.length >= 8) return;
+  if ((root.nodeName === "IFRAME" || root.nodeName === "FRAME") && typeof root.nodeId === "number") {
+    const attrs = root.attributes ?? [];
+    let text = "";
+    for (let i = 0; i + 1 < attrs.length; i += 2) {
+      if (attrs[i] === "src" || attrs[i] === "title") text += `${attrs[i + 1]} `;
+    }
+    if (WIDGET_SRC_RE.test(text)) out.push(root.nodeId);
+  }
+  for (const child of root.children ?? []) collectWidgetNodes(child, out);
+  for (const shadow of root.shadowRoots ?? []) collectWidgetNodes(shadow, out);
+  if (root.contentDocument) collectWidgetNodes(root.contentDocument, out);
+}
+
+// Prefer the largest on-screen widget: challenge pages often carry an
+// off-screen duplicate that must not be clicked.
+function pickWidget(boxes: WidgetBox[]): WidgetBox | null {
+  const usable = boxes.filter(
+    (b) => b.w >= 40 && b.h >= 18 && b.x > -1 && b.y > -1 && b.x < 5000 && b.y < 5000,
+  );
+  usable.sort((a, b) => b.w * b.h - a.w * a.h);
+  return usable[0] ?? null;
+}
+
+async function findChallengeWidget(cdp: CDPLike): Promise<WidgetBox | null> {
+  // Light DOM first: one cheap evaluation, covers widgets that are not inside a
+  // shadow root.
+  try {
+    const raw = String(await cdp.evaluate(WIDGET_RECTS_JS));
+    const frames = JSON.parse(raw) as Array<WidgetBox & { src?: string }>;
+    const box = pickWidget(frames.filter((f) => WIDGET_SRC_RE.test(String(f.src ?? ""))));
+    if (box) return box;
+  } catch {
+    // Fall through to the DOM domain.
+  }
+  // Shadow roots (Cloudflare wraps its iframe in one, usually closed).
+  try {
+    const doc = (await cdp.call("DOM.getDocument", { depth: -1, pierce: true })) as {
+      root?: DomNodeLike;
+    };
+    const nodeIds: number[] = [];
+    collectWidgetNodes(doc?.root, nodeIds);
+    const boxes: WidgetBox[] = [];
+    for (const nodeId of nodeIds) {
+      const resolved = (await cdp.call("DOM.resolveNode", { nodeId })) as {
+        object?: { objectId?: string };
+      };
+      const objectId = resolved?.object?.objectId;
+      if (!objectId) continue;
+      const measured = (await cdp.call("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration:
+          "function(){const r=this.getBoundingClientRect();const s=getComputedStyle(this);return JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height,vis:s.visibility,disp:s.display});}",
+        returnByValue: true,
+      })) as { result?: { value?: string } };
+      try {
+        const box = JSON.parse(measured?.result?.value ?? "{}") as WidgetBox & {
+          vis?: string;
+          disp?: string;
+        };
+        if (box.vis !== "visible" || box.disp === "none") continue;
+        boxes.push(box);
+      } catch {
+        // Skip unmeasurable nodes.
+      }
+    }
+    return pickWidget(boxes);
+  } catch {
+    return null;
+  }
+}
+
+async function dispatchClick(cdp: CDPLike, x: number, y: number): Promise<void> {
+  const base = { x, y, button: "left" as const, clickCount: 1 };
+  await cdp.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+  await sleep(80);
+  await cdp.call("Input.dispatchMouseEvent", { type: "mousePressed", ...base });
+  await sleep(60);
+  await cdp.call("Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
+}
+
+// Click the challenge checkbox the way a user would. The first attempt targets
+// the checkbox (left edge, vertically centred), the second the widget centre.
+async function clickChallengeWidget(cdp: CDPLike, attempt: number): Promise<boolean> {
+  const box = await findChallengeWidget(cdp);
+  if (!box) return false;
+  const x = attempt === 0 ? box.x + Math.min(28, box.w * 0.15) : box.x + box.w / 2;
+  const y = box.y + box.h / 2;
+  await dispatchClick(cdp, Math.round(x), Math.round(y));
+  return true;
+}
+
+// Wait for a bot check to clear. Bot checks that only need JavaScript clear on
+// their own once the tab is visible. The interactive variant needs one click.
+// A challenge that has not moved after CHALLENGE_RELOAD_AFTER_MS gets a single
+// reload. Returns false when nothing worked within `timeoutMs`.
+async function waitForChallengeToClear(
+  cdp: CDPLike,
+  opts: {
+    timeoutMs: number;
+    isCleared: () => boolean | Promise<boolean>;
+    onStatus: StatusFn;
+    // Reload once after this long without progress. 0 disables it (a
+    // JavaScript shell is already loading - a reload would restart it).
+    reloadAfterMs?: number;
+  },
+): Promise<boolean> {
+  const startedAt = Date.now();
+  let finderRuns = 0;
+  let reloaded = false;
+  const reloadAfterMs = opts.reloadAfterMs ?? CHALLENGE_RELOAD_AFTER_MS;
+  while (Date.now() - startedAt < opts.timeoutMs) {
+    await sleep(CHALLENGE_POLL_MS);
+    if (await opts.isCleared()) return true;
+    const elapsed = Date.now() - startedAt;
+    // A visible widget is the one case that needs a gesture. Give the challenge
+    // script a moment to render the widget first, and look for it at most three
+    // times (the DOM walk is not free).
+    if (finderRuns < 3 && elapsed > 1_200) {
+      const attempt = finderRuns++;
+      if (await clickChallengeWidget(cdp, attempt)) {
+        opts.onStatus(attempt === 0 ? "Clicking the bot check..." : "Clicking the bot check again...");
+      }
+    }
+    if (!reloaded && reloadAfterMs > 0 && elapsed > reloadAfterMs) {
+      opts.onStatus("Bot check is taking long - reloading once...");
+      try {
+        await cdp.call("Page.reload", { ignoreCache: false });
+      } catch {
+        // Non-fatal: the wait below decides.
+      }
+      reloaded = true;
+    }
+  }
+  return false;
+}
+
+function blockedMarker(wall: WallInfo): string {
+  return `__BLOCKED__: ${wall.kind}: ${wall.detail}`;
+}
+
+// The page the tab ended up on is not the one that was asked for. Only host and
+// path count: http->https, `www.`, a trailing slash, query parameters and
+// fragments are not worth reporting, but a different page shape is - t.me/s/
+// <group> redirects to the group's join page and drops the message feed.
+function redirectNoteFor(requested: string, final: string): string | null {
+  try {
+    const a = new URL(requested);
+    const b = new URL(final);
+    const host = (u: URL): string => u.hostname.toLowerCase().replace(/^www\./, "");
+    const path = (u: URL): string => u.pathname.replace(/\/+$/, "");
+    if (host(a) === host(b) && path(a) === path(b)) return null;
+    return `> Redirected: ${requested} -> ${final}`;
+  } catch {
+    return null;
+  }
+}
+
+const DOWNLOAD_TEXT_MAX = 200_000;
+
+interface DownloadBody {
+  status?: number;
+  ct?: string;
+  total?: number;
+  truncated?: boolean;
+  bad?: number;
+  text?: string;
+  decoded?: string;
+  error?: string;
+}
+
+function formatBytes(n: number): string {
+  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} bytes`;
+}
+
+// Longest run of backticks in the body, so a code fence can be longer than any
+// fence the file itself contains.
+function longestBacktickRun(text: string): number {
+  let longest = 0;
+  let run = 0;
+  for (const ch of text) {
+    run = ch === "`" ? run + 1 : 0;
+    if (run > longest) longest = run;
+  }
+  return longest;
+}
+
+// A URL can answer with `Content-Disposition: attachment`, which Chrome turns
+// into a download instead of a document - the tab stays on about:blank. The
+// bytes are still reachable: fetch() ignores that header. Doing it from a page
+// on the site's own origin keeps cookies, TLS and proxy in play and avoids
+// CORS (about:blank has an opaque origin, so fetching from it would fail).
+async function readDownload(cdp: CDPLike, url: string, onStatus: StatusFn): Promise<string> {
+  let origin: string;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return "__BLOCKED__: download: invalid URL";
+  }
+  onStatus("The URL is a file download - reading it through the browser...");
+  const originLoaded = new Promise<void>((resolve) => {
+    cdp.onEvent("Page.loadEventFired", () => resolve());
+  });
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, LOAD_WAIT_MS); });
+  try {
+    await cdp.call("Page.navigate", { url: `${origin}/` }, NAVIGATE_TIMEOUT_MS);
+  } catch {
+    return `__BLOCKED__: download: could not open ${origin} to read the file`;
+  }
+  await Promise.race([originLoaded, timeout]);
+  clearTimeout(timer);
+
+  let info: DownloadBody;
+  try {
+    info = JSON.parse(String(await cdp.evaluate(downloadFetchJs(url)))) as DownloadBody;
+  } catch {
+    return "__BLOCKED__: download: could not read the file";
+  }
+  if (info.error) {
+    return `__BLOCKED__: download: ${info.error.replace(/\s+/g, " ").slice(0, 160)}`;
+  }
+
+  const total = info.total ?? 0;
+  const ct = (info.ct ?? "").split(";")[0].trim() || "unknown type";
+  if (total === 0) return `__BLOCKED__: download: empty file (${ct})`;
+  const rawText = info.text ?? "";
+  const binary = !info.decoded && rawText.length > 0 && (info.bad ?? 0) / rawText.length > 0.01;
+  if (binary) return `__BLOCKED__: download: ${ct}, ${formatBytes(total)} - binary data, not text`;
+  const text = (info.decoded || rawText).slice(0, DOWNLOAD_TEXT_MAX);
+  if (!text.trim()) return `__BLOCKED__: download: ${ct}, ${formatBytes(total)} - no readable text`;
+
+  const note =
+    `The URL is a file download (${ct}, ${formatBytes(total)}), not a web page.` +
+    (info.decoded ? " The server sent it base64-encoded; the text below is decoded." : "") +
+    (text.length < (info.decoded || rawText).length
+      ? ` Showing the first ${DOWNLOAD_TEXT_MAX.toLocaleString("en-US")} characters.`
+      : "");
+  const fence = "`".repeat(Math.max(3, longestBacktickRun(text) + 1));
+  return [
+    `# ${url}`,
+    "",
+    `URL: ${url}`,
+    "",
+    `> ${note}`,
+    "",
+    "## Content",
+    fence,
+    text,
+    fence,
+  ].join("\n");
+}
+
 // Page-state probe used by waitForSettledDocument():
 // "<body?>|<readyState>|<textLength>|<href>". The `pi-settle` marker lets the
 // unit-test fake recognise this evaluation.
 export const DOC_STATE_JS =
-  "(() => { /*pi-settle*/ try { const b = document.body; return (document.documentElement ? (b ? 'body' : 'nobody') : 'nodoc') + '|' + document.readyState + '|' + (b && b.innerText ? b.innerText.length : 0) + '|' + location.href; } catch (e) { return 'err|' + document.readyState + '|0|'; } })()";
+  "(() => { /* pi-settle */ try { const b = document.body; return (document.documentElement ? (b ? 'body' : 'nobody') : 'nodoc') + '|' + document.readyState + '|' + (b && b.innerText ? b.innerText.length : 0) + '|' + location.href; } catch (e) { return 'err|' + document.readyState + '|0|'; } })()";
 
 // A document with at least this much text is considered settled: it has real
 // content, so a later client-side navigation is an ad/hijack rather than the
 // page still loading.
 const SETTLED_TEXT_CHARS = 400;
+
+// Activate the tab if a content-first wait still has no text by then: JS app
+// shells and bot-check scripts need a visible tab to make progress.
+const CONTENT_ACTIVATE_MS = 2_500;
 
 // How long a visit waits for the load event (or for content, see
 // CONTENT_POLL_MS) before carrying on with whatever the page has.
@@ -779,6 +1151,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     resolveGoogleRedirects = false,
     safetyExtract = false,
     contentFirst = false,
+    wallWaitMs = WALL_WAIT_MS,
     onStatus,
   } = opts;
 
@@ -884,15 +1257,15 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
       (!gatewayError && (await looksLikeChallengePage(cdp)))
     ) {
       onStatus(`HTTP ${first.status} - waiting for the site's bot check to clear...`);
-      const deadline = Date.now() + interstitialWaitMs;
-      while (Date.now() < deadline) {
-        await sleep(INTERSTITIAL_POLL_MS);
-        const doc = latestMainDoc();
-        if (doc && doc.status < 400) {
-          onStatus("Bot check cleared - extracting...");
-          return;
-        }
-      }
+      const cleared = await waitForChallengeToClear(cdp, {
+        timeoutMs: interstitialWaitMs,
+        onStatus,
+        isCleared: () => {
+          const doc = latestMainDoc();
+          return !!doc && doc.status < 400;
+        },
+      });
+      if (cleared) onStatus("Bot check cleared - extracting...");
       return; // still blocked -> error marker below
     }
 
@@ -922,7 +1295,13 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   let loadTimer!: ReturnType<typeof setTimeout>;
   const loadTimeout = new Promise<void>((resolve) => { loadTimer = setTimeout(resolve, LOAD_WAIT_MS); });
 
-  await navigateToPage(cdp, url, loaded, onStatus);
+  const navInfo = await navigateToPage(cdp, url, loaded, onStatus);
+
+  // A download never becomes a document (the tab stays on about:blank), so
+  // there is nothing to wait for and nothing to extract here.
+  if (navInfo.isDownload) {
+    return readDownload(cdp, url, onStatus);
+  }
 
   // Waiting for the load event is not always worth it: on ad-heavy pages hung
   // frames and analytics requests keep it from firing for the full timeout
@@ -934,12 +1313,26 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   const racers: Array<Promise<void>> = [loaded, loadTimeout];
   if (contentFirst) {
     const contentReady = (async () => {
-      const deadline = Date.now() + LOAD_WAIT_MS;
-      while (!loadRaceDone && Date.now() < deadline) {
+      const startedAt = Date.now();
+      let activated = false;
+      while (!loadRaceDone && Date.now() - startedAt < LOAD_WAIT_MS) {
         const state = String(await cdp.evaluate(DOC_STATE_JS));
         const m = /^(body|nobody|nodoc|err)\|(\w*)\|(\d+)\|/.exec(state);
         if (!m) return;
         if (m[1] === "body" && Number(m[3]) >= SETTLED_TEXT_CHARS) return;
+        // Chrome pauses requestAnimationFrame and visibility-gated JS in a
+        // hidden tab. Bot-check scripts and JavaScript app shells therefore
+        // never get past "Loading..." until the tab is visible (observed on
+        // pypi.org and lensisku.lojban.org), so activate it after a moment
+        // without text.
+        if (!activated && Date.now() - startedAt >= CONTENT_ACTIVATE_MS) {
+          activated = true;
+          try {
+            await cdp.call("Page.bringToFront");
+          } catch {
+            // Non-fatal: the launch flags still keep the renderer alive.
+          }
+        }
         await sleep(CONTENT_POLL_MS);
       }
     })();
@@ -1007,6 +1400,40 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     if (settledHref.startsWith("chrome-error://")) {
       return `__NAV_ERROR__: ${url}`;
     }
+  }
+
+  // A page can answer 200 and still be a wall instead of content: Fastly's
+  // "Client Challenge" (pypi.org), a reCAPTCHA gate (jbovlaste.lojban.org), a
+  // login form, or a JavaScript shell that still says "Loading..."
+  // (lensisku.lojban.org). A challenge and a shell clear themselves once the
+  // tab is visible and given a few seconds, so activate it and wait. A CAPTCHA
+  // or a login cannot be solved from here and is reported instead.
+  const wall = await probeWall(cdp);
+  if (wall) {
+    if (wall.kind === "captcha" || wall.kind === "login") {
+      onStatus(`Page is a ${wall.kind} gate - cannot read it`);
+      return blockedMarker(wall);
+    }
+    onStatus(
+      wall.kind === "challenge"
+        ? "Bot check page - activating the tab and waiting..."
+        : "Page is still loading - activating the tab and waiting...",
+    );
+    try {
+      await cdp.call("Page.bringToFront");
+    } catch {
+      // Non-fatal: the launch flags still keep the renderer alive.
+    }
+    if (!(await waitForChallengeToClear(cdp, { timeoutMs: wallWaitMs, onStatus, reloadAfterMs: wall.kind === "challenge" ? CHALLENGE_RELOAD_AFTER_MS : 0, isCleared: async () => !(await probeWall(cdp)) }))) {
+      onStatus(`Page did not become readable (${wall.kind})`);
+      return blockedMarker(wall);
+    }
+    // The page may have reloaded itself (bot check) or routed (SPA).
+    settledHref = String(await cdp.evaluate("location.href"));
+    if (settledHref.startsWith("chrome-error://")) {
+      return `__NAV_ERROR__: ${url}`;
+    }
+    await waitForSettledDocument(cdp);
   }
 
   // Safety extraction, taken before the waits and scrolling below. Ad and
@@ -1130,7 +1557,11 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   if (result.length > MAX_RESULT_BYTES) {
     return result.slice(0, MAX_RESULT_BYTES) + "\n\n[Content truncated at 1MB]";
   }
-  return result;
+  // A redirect can land on a different page shape entirely (t.me/s/<group>
+  // redirects to the group's join page, dropping the message feed). Say so
+  // instead of letting the model assume it got the page it asked for.
+  const redirectNote = redirectNoteFor(url, settledHref);
+  return redirectNote ? `${redirectNote}\n\n${result}` : result;
 }
 
 async function runInPage(opts: RunInPageOptions): Promise<string> {
@@ -1164,6 +1595,10 @@ export interface SearchResult {
   // sits on Chrome's error page (chrome-error://chromewebdata/), which has no
   // content to extract.
   navError?: string;
+  // Set (with an empty `markdown`) when the page is a wall rather than content:
+  // a bot check, a CAPTCHA, a login form, a JavaScript shell, or a file
+  // download whose body is not text.
+  blocked?: { kind: string; detail: string };
 }
 
 export interface VisitPageOptions {
@@ -1298,6 +1733,10 @@ function resolveHttpError(markdown: string, url: string): SearchResult {
   const navErr = markdown.match(/^__NAV_ERROR__: (\S*)$/);
   if (navErr) {
     return { markdown: "", url: navErr[1] || url, navError: "navigation failed" };
+  }
+  const blocked = markdown.match(/^__BLOCKED__: (\w+): (.*)$/);
+  if (blocked) {
+    return { markdown: "", url, blocked: { kind: blocked[1], detail: blocked[2].trim() } };
   }
   return { markdown, url };
 }

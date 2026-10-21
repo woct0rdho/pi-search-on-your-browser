@@ -283,6 +283,43 @@ function visitPageToolDefinition() {
         };
       }
 
+      // Wall instead of content: the page is a bot check that did not clear, a
+      // CAPTCHA or login gate, a JavaScript shell, or a file download that is
+      // not text. Say what it is so the model does not treat it as the page.
+      if (result.blocked) {
+        const { kind, detail } = result.blocked;
+        let text: string;
+        if (kind === "challenge") {
+          text =
+            `The site answered ${result.url} with a bot check instead of the page (${detail}), and it did not clear. ` +
+            `The tool's Chrome window is visible - open that URL there, let the check finish, then retry. ` +
+            `The clearance is stored in the browser profile.`;
+        } else if (kind === "captcha") {
+          text =
+            `A CAPTCHA gates ${result.url} (${detail}). It cannot be solved automatically - ` +
+            `open the URL in the visible Chrome window, solve it there, then retry.`;
+        } else if (kind === "login") {
+          text =
+            `${result.url} requires a login (${detail}). Sign in in the visible Chrome window, ` +
+            `then retry - the session stays in the browser profile.`;
+        } else if (kind === "shell") {
+          text =
+            `The page at ${result.url} rendered no readable text (${detail}) even after waiting. ` +
+            `It is a JavaScript app that did not hydrate; retry once, or use a general browser-use tool for interactive pages.`;
+        } else if (kind === "download") {
+          text =
+            `${result.url} is a file download, not a web page (${detail}). ` +
+            `It cannot be returned as page Markdown - download the file instead.`;
+        } else {
+          text = `The page could not be read (${kind}: ${detail}).`;
+        }
+        return {
+          content: [{ type: "text" as const, text }],
+          details: { url: result.url, elapsed: `${fetchElapsed}s`, blocked: kind },
+          isError: true,
+        };
+      }
+
       // HTTP error (4xx/5xx) -> surface as an error result
       // The server returned an error status (e.g. 404 on a dead link). Return
       // isError so the LLM knows the URL didn't work and can try another -

@@ -11,6 +11,8 @@ import {
   AMAZON_SEARCH_JS,
   SCHOLAR_EXTRACT_JS,
   DEFUDDLE_DRIVER_JS,
+  WALL_PROBE_JS,
+  downloadFetchJs,
 } from "../../src/extractors.ts";
 
 // Every extractor is a JS string built from a TypeScript template literal.
@@ -31,6 +33,8 @@ const extractors: Record<string, string> = {
   AMAZON_SEARCH_JS,
   SCHOLAR_EXTRACT_JS,
   DEFUDDLE_DRIVER_JS,
+  WALL_PROBE_JS,
+  DOWNLOAD_FETCH_JS: downloadFetchJs("https://example.com/file.txt"),
 };
 
 for (const [name, js] of Object.entries(extractors)) {

@@ -263,6 +263,51 @@ not worth writing per site. What the tool does for those pages:
   outside what an extraction tool can do. The visible Chrome window can clear
   those interactively, and the cookie stays in the profile.
 
+### Walls, shell pages and downloads
+
+A page can answer `200 OK` and still not be the page: a bot check, a CAPTCHA,
+a login form, a JavaScript shell that has not hydrated, or a file download.
+These used to come back as short, plausible-looking "content". Now:
+
+- Bot checks served as 200 (Fastly's "Client Challenge" on pypi.org,
+  Cloudflare's "Just a moment...") and JavaScript shells ("Loading...",
+  lensisku.lojban.org) are detected in the page after it settles, the tab is
+  activated and given up to 30 s to render itself. Both clear once the tab is
+  visible - a hidden tab pauses rAF and challenge scripts - so the extraction
+  runs on the real page. If nothing moves after 12 s, the challenge gets one
+  reload (Cloudflare's script occasionally stalls waiting for a fresh
+  document). If it still does not clear, the tool returns an error naming what
+  was on the page instead of handing the wall back as content.
+- Interactive bot checks (the "Verify you are human" Turnstile checkbox,
+  reCAPTCHA/hCaptcha equivalents) are clicked like a user would: the tool finds
+  the widget's box - including inside a *closed shadow root*, which only CDP's
+  DOM domain can see - and dispatches a real mouse move + click at the
+  checkbox, then at the widget centre if the first click did not take. This is
+  the same approach FlareSolverr and nodriver use for Cloudflare; no extra
+  service or dependency. CAPTCHA *solving* is out of scope by design.
+- CAPTCHA gates (a `reCAPTCHA`/`hCaptcha`/Turnstile widget plus gate
+  wording such as "Verify you are human" or "Login To Skip This Step", e.g.
+  jbovlaste's export form) and login forms (a *visible* password field on a
+  short page. A hidden login modal in a long page's header is not a wall) are
+  reported straight away with a hint to solve/sign in in the visible Chrome
+  window and retry. A page that merely embeds a Turnstile widget in its own
+  form (nowsecure.nl) is content, not a gate.
+- File downloads (`Content-Disposition: attachment`: Gitiles'
+  `?format=TEXT`, API endpoints, CSV/JSON exports) are read with a same-origin
+  `fetch()` from the browser - cookies, TLS and proxy included - and returned
+  as fenced text, base64 bodies decoded. Binary files are reported as a
+  download instead of being rendered as garbage.
+- Redirects that change the page shape are called out with a
+  `> Redirected: <requested> -> <final>` line (t.me/s/`<group>` redirects to
+  the group's join page and drops the message feed). Scheme, `www.`, trailing
+  slash and query-only changes are not reported.
+
+What stays out of scope: solving CAPTCHAs, multi-step interactive forms, and
+sites that challenge every request from a fresh IP (a rotating proxy defeats
+`cf_clearance`). Those are reported as errors instead of pretending they
+worked, which is also the point where a general browser-use tool is the better
+answer.
+
 ### Optional `clean` - clean article Markdown via Defuddle
 
 By default, `visit_page` on a generic (non-specialized) page uses a naive
@@ -519,14 +564,15 @@ pnpm install
 pnpm test
 ```
 
-Seven layers of tests (140 total):
+Eight layers of tests (163 total):
 - `tests/unit/urls.test.ts` - table-driven tests for the URL classifiers (`isXUrl`, `isRedditPostUrl`, `isAmazonProductUrl`, `isAmazonSearchUrl`, `isScholarSearchUrl`).
 - `tests/unit/extractors-parse.test.ts` - validates every extractor JS string (`X_EXTRACT_JS`, `REDDIT_EXTRACT_JS`, etc.) parses as valid JavaScript via `new Function()`. Catches template-literal escaping bugs (the `\n` vs real-newline class of errors) without a browser.
-- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget. Client-side redirects are waited out (`waitForSettledDocument`), the pre-scroll extraction is kept when the page navigates away mid-visit, a tab that lands on Chrome's error page re-navigates once, and specialized extractors still run exactly once.
+- `tests/unit/cdp-client.test.ts` - tests `runInPageSession` (the navigate/waitForSelector/scroll/extract logic) against a fake `CDPLike` implementation. Includes the regression test for the v0.5.1 bug: `cdp.evaluate()` stringifies return values, so `String(false)` -> `"false"` (truthy). The test asserts `waitForSelector` does *not* break on the first poll when the selector is absent. Also tests the `fallbackJs` path (Defuddle -> generic extractor fallback), HTTP error detection (4xx/5xx -> `__HTTP_ERROR__` marker, extraction skipped, no fallback), the Defuddle bundle resolved from the installed npm package (UMD, full entry with the Markdown converter, no Node-only deps, cached, and the dependency stays declared), the background-renderer launch flags, browser discovery (Windows install paths, `CHROME_PATH`, Edge fallback), the proxy flag, the actionable spawn-error message for the Windows `spawn google-chrome ENOENT` crash, and that the only `console.*` write in `chrome.ts` is the one gated behind `PI_SEARCH_DEBUG` (no TUI input-bar noise). Navigation resilience under parallel load is covered too: `Page.navigate` retries (and accepts a page that loads while the command reply is still pending), non-timeout errors (a dead socket) are *not* retried, and the final error names the attempt budget. Client-side redirects are waited out (`waitForSettledDocument`), the pre-scroll extraction is kept when the page navigates away mid-visit, a tab that lands on Chrome's error page re-navigates once, and specialized extractors still run exactly once. The wall/download paths are covered too: a bot-check page that clears is extracted after the tab is activated, one that does not returns a `__BLOCKED__: challenge` marker (likewise `captcha` and `login`), a visible bot-check widget is clicked at the checkbox coordinates (then at the widget centre) and an off-screen duplicate is ignored, no click happens for a JavaScript-only challenge, a text download is read through a same-origin `fetch()` and returned fenced (base64 decoded), a binary download is reported, and a host/path-changing redirect adds a `> Redirected:` line.
 - `tests/unit/subagent.test.ts` - tests the subagent layer used by `visit_page`'s `summary` mode: config load/save/resolve (including the `summaryEnabled` and `cleanEnabled` flags, their independence, and the `PI_BROWSE_SUMMARY_ENABLED` / `PI_BROWSE_CLEAN_ENABLED` env vars), reasoning-level validation, context-window truncation with token-budget reservation, and summary-prompt construction. Also covers the browser proxy config: value normalization (`host:port` -> `http://`, socks, off switches, invalid values), resolution precedence (file `browser.proxy` > top-level `proxy` > `PI_SEARCH_PROXY` > direct), tolerance of a malformed file, the saved file shape, and the `/browse` summary line. No network calls - the model call itself lives in `index.ts` (via `ctx.modelRegistry.streamSimple()`) and is only exercised live.
 - `tests/unit/tool-surface.test.ts` - asserts the agent-facing `visit_page` text across all four `summaryEnabled` * `cleanEnabled` combinations: a disabled feature is never mentioned (no parameter description, no guideline, no `/browse` hint) while the base stays minimal and the description/snippet only grow as features are enabled. No site-specific extractor names (X/Twitter, Reddit, Amazon, Scholar) appear anywhere, and `stripDisabledArguments` removes exactly the disabled arguments without mutating the input.
 - `tests/unit/google-links.test.ts` - covers Google redirect handling: `isGoogleRedirectUrl` (`/url` and `/goto` on any google host, nothing else), `findGoogleRedirectUrls` (dedupe, order, non-redirect links ignored), `replaceGoogleRedirects` (mapped URLs swapped, unresolved ones kept), and the CDP-driven `resolveGoogleRedirectsInBrowser` against a fake CDP - redirect hops mapped from `Network.requestWillBeSent` events, `Location`-header preference, no-op when there is nothing to resolve, timeout keeping the original `/goto` link, and a failed trigger leaving the markdown untouched. No browser, no network.
 - `tests/unit/image-search.test.ts` - covers Google Images: `clampImageCount` (default, floors, clamps, non-numbers) and the generated extractor (`getGoogleImageSearchJs`) - it parses as JavaScript, embeds the clamped count, keeps the DOM contract it depends on (data-lpage tiles, the preview image selector, gstatic detection, the `(google-cached)` marker, and both the image and page URL lines), and bounds its own runtime against the CDP timeout. No browser, no network.
+- `tests/unit/wall.test.ts` - table-driven tests for `classifyWall`, the pure function behind wall detection: a bot-check interstitial served with 200 (Fastly "Client Challenge", Cloudflare "Just a moment..."), a CAPTCHA gate, a login form, a JavaScript shell ("Loading..."), and the negative cases that must stay content (a long article mentioning "Access Denied", a contact page with a reCAPTCHA, a page that merely embeds a Turnstile widget, an image-only gallery, an image URL with no scripts, a short static page).
 
 ### Type-checking
 
