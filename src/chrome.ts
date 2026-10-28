@@ -43,6 +43,8 @@ import {
   type WallKind,
   type WallState,
   WIDGET_RECTS_JS,
+  looksNavOnly,
+  markdownProseLength,
   downloadFetchJs,
 } from "./extractors.ts";
 
@@ -678,6 +680,12 @@ interface RunInPageOptions {
   // Used by visit_page's generic extraction. The specialized extractors wait
   // for their own selectors instead.
   contentFirst?: boolean;
+  // When true, re-probe the live page once after extraction: a gate can
+  // replace the document after the settle probe and be handed back as content
+  // (a check page that paints late). Also retries a nav-only result, which is
+  // how snapshots and slow SPAs fail. Off for Google/Scholar searches, which
+  // have their own result shapes.
+  wallRecheck?: boolean;
   // How long a detected wall (bot-check interstitial, JavaScript app shell)
   // gets to render itself after the tab is activated. 0 disables the wait
   // (tests). Default WALL_WAIT_MS.
@@ -794,6 +802,7 @@ function parseWallState(raw: string): WallState | undefined {
       password: Boolean(parsed.password),
       scripts: Number(parsed.scripts),
       images: Number(parsed.images ?? 0),
+      gate: typeof parsed.gate === "string" ? parsed.gate : "",
     };
   } catch {
     return undefined;
@@ -1109,6 +1118,26 @@ const LOAD_WAIT_MS = 10_000;
 // Poll interval of the content-first readiness probe.
 const CONTENT_POLL_MS = 200;
 
+// Extracted output shorter than this is checked against the live page's wall
+// state: a gate that appeared after the settle probe returns a few hundred
+// characters of "verify you are human" and must not pass as content.
+const LATE_WALL_RECHECK_CHARS = 600;
+
+// How long a nav-only result gets for its body to render before it is
+// extracted a second time.
+const THIN_CONTENT_WAIT_MS = 5_000;
+const THIN_CONTENT_POLL_MS = 400;
+
+// A short page can be a placeholder that the site is about to replace: an
+// unrecognised vendor check, a cookie/consent stub, a client-rendered page.
+// Matching those by their wording is endless and site-specific, so a document
+// that settles with little text and scripts running is watched for a few
+// seconds instead. Well under the 30s wall budget: it only decides whether the
+// text is final, and long pages skip it entirely.
+const SHORT_PAGE_WATCH_CHARS = 600;
+const SHORT_PAGE_WATCH_MS = 6_000;
+const SHORT_PAGE_POLL_MS = 300;
+
 // Wait until the document stops changing.
 //
 // A page that already has content is returned immediately - waiting on it only
@@ -1135,6 +1164,39 @@ async function waitForSettledDocument(cdp: CDPLike, timeoutMs = 4000): Promise<v
   }
 }
 
+// Watch a short document for a few seconds and report whether it grew. This is
+// how a placeholder page is recognised without knowing its wording: bot checks,
+// consent stubs and client-rendered pages all paint a few lines first and
+// replace them shortly after, while a genuinely short page (a 404, a sign-in
+// stub, an index of links) does not move at all. Only the text length is
+// compared, so nothing here is specific to a site or a vendor.
+async function waitForShortPageGrowth(
+  cdp: Pick<CDPLike, "evaluate">,
+  opts: { timeoutMs?: number; onStatus?: StatusFn } = {},
+): Promise<boolean> {
+  const read = async (): Promise<{ len: number } | undefined> => {
+    const state = await cdp.evaluate("/* pi-short-page */" + DOC_STATE_JS);
+    const match = /^(body|nobody|nodoc|err)\|\w*\|(\d+)\|/.exec(state);
+    return match ? { len: Number(match[2]) } : undefined;
+  };
+  const first = await read();
+  if (!first || first.len >= SHORT_PAGE_WATCH_CHARS) return false;
+  // A document without scripts cannot render more on its own.
+  if (Number(await cdp.evaluate("document.scripts.length")) === 0) return false;
+  const deadline = Date.now() + (opts.timeoutMs ?? SHORT_PAGE_WATCH_MS);
+  while (Date.now() < deadline) {
+    await sleep(SHORT_PAGE_POLL_MS);
+    const next = await read();
+    if (!next) return false;
+    // Grew, or blanked for a reload: something is still painting.
+    if (next.len > first.len + 300 || next.len < 40) {
+      opts.onStatus?.("Short page is still rendering - waiting...");
+      return true;
+    }
+  }
+  return false;
+}
+
 // Session logic: navigate, wait, scroll, extract - all against a connected
 // CDP client. Split out from runInPage so it can be tested with a fake
 // CDPLike (no real Chrome, no WebSocket).
@@ -1155,6 +1217,7 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     resolveGoogleRedirects = false,
     safetyExtract = false,
     contentFirst = false,
+    wallRecheck = true,
     wallWaitMs = WALL_WAIT_MS,
     onStatus,
   } = opts;
@@ -1412,7 +1475,18 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
   // (lensisku.lojban.org). A challenge and a shell clear themselves once the
   // tab is visible and given a few seconds, so activate it and wait. A CAPTCHA
   // or a login cannot be solved from here and is reported instead.
-  const wall = await probeWall(cdp);
+  let wall = await probeWall(cdp);
+  // Nothing recognisable, but the page is short and still moving: probe again
+  // once it grew, in case the growth was a check page or a route change. This
+  // is the vendor-agnostic path - no wording list involved.
+  if (!wall && wallWaitMs > 0 && (await waitForShortPageGrowth(cdp, { onStatus }))) {
+    await waitForSettledDocument(cdp);
+    settledHref = String(await cdp.evaluate("location.href"));
+    if (settledHref.startsWith("chrome-error://")) {
+      return `__NAV_ERROR__: ${url}`;
+    }
+    wall = await probeWall(cdp);
+  }
   if (wall) {
     if (wall.kind === "captcha" || wall.kind === "login") {
       onStatus(`Page is a ${wall.kind} gate - cannot read it`);
@@ -1549,6 +1623,74 @@ async function runInPageSession(cdp: CDPLike, opts: RunInPageOptions): Promise<s
     result = await cdp.evaluate(opts.fallbackJs);
   }
 
+  // A gate can still show up after the settle probe and swap the document out
+  // while the extractor runs (a check page that paints late, after the first
+  // render). Short output is the tell: ask the live page once whether it is a
+  // gate now instead of handing the gate back as content.
+  if (
+    wallRecheck &&
+    result.trim().length > 0 &&
+    result.trim().length < LATE_WALL_RECHECK_CHARS &&
+    !result.startsWith("__")
+  ) {
+    const late = await probeWall(cdp);
+    if (late) {
+      if (late.kind === "captcha" || late.kind === "login") {
+        onStatus(`Page is a ${late.kind} gate - cannot read it`);
+        return blockedMarker(late);
+      }
+      onStatus(`Page became a ${late.kind} - waiting for it...`);
+      const cleared = await waitForChallengeToClear(cdp, {
+        timeoutMs: wallWaitMs,
+        onStatus,
+        reloadAfterMs: late.kind === "challenge" ? CHALLENGE_RELOAD_AFTER_MS : 0,
+        isCleared: async () => !(await probeWall(cdp)),
+      });
+      if (!cleared) {
+        onStatus(`Page did not become readable (${late.kind})`);
+        return blockedMarker(late);
+      }
+      await waitForSettledDocument(cdp);
+      onStatus("Extracting content...");
+      result = await cdp.evaluate(js);
+    }
+  }
+
+  // A snapshot or SPA can render its navigation before its body: retry a
+  // result that is mostly links, and keep whichever copy has more prose. The
+  // wait ends as soon as the page stops changing, so an index page that is
+  // legitimately a list of links costs about a second and no second pass.
+  if (wallRecheck && !result.startsWith("__") && looksNavOnly(result)) {
+    onStatus("Page rendered only its navigation - waiting for the body...");
+    const before = markdownProseLength(result);
+    const startedAt = Date.now();
+    let lastLen = -1;
+    let stable = 0;
+    let grew = false;
+    while (Date.now() - startedAt < THIN_CONTENT_WAIT_MS) {
+      await sleep(THIN_CONTENT_POLL_MS);
+      const match = /^(body|nobody|nodoc|err)\|\w*\|(\d+)\|/.exec(await cdp.evaluate(DOC_STATE_JS));
+      const len = match ? Number(match[2]) : -1;
+      if (len > before * 2 + 200) {
+        grew = true;
+        break;
+      }
+      if (len === lastLen) {
+        if (++stable >= 2) break; // nothing is coming
+      } else {
+        stable = 0;
+      }
+      lastLen = len;
+    }
+    if (grew) {
+      const retried = await cdp.evaluate(js);
+      if (!retried.startsWith("__") && markdownProseLength(retried) > before) {
+        onStatus("Got the page body on the second pass");
+        result = retried;
+      }
+    }
+  }
+
   // Google search results may contain `/goto?url=<opaque>` redirect wrappers
   // that JavaScript cannot decode or follow. Ask Google for the destination
   // (302 Location) from inside this tab - it has the session, cookies and
@@ -1639,6 +1781,9 @@ async function extractVia(
     bringToFront?: boolean;
     safetyExtract?: boolean;
     contentFirst?: boolean;
+    // Re-probe the page after extraction (late gates, nav-only results). Off
+    // for searches, whose results are already lists of links.
+    wallRecheck?: boolean;
     // Resolve Google `/goto` redirect links in the open tab before returning
     // (see src/google-links.ts). Used by googleSearch.
     resolveGoogleRedirects?: boolean;
@@ -1657,6 +1802,7 @@ async function extractVia(
     bringToFront: opts.bringToFront ?? false,
     safetyExtract: opts.safetyExtract ?? false,
     contentFirst: opts.contentFirst ?? false,
+    wallRecheck: opts.wallRecheck ?? false,
     resolveGoogleRedirects: opts.resolveGoogleRedirects ?? false,
     onStatus: status,
   });
@@ -1776,7 +1922,7 @@ export function readImageFile(input: string): LocalImage {
   if (stat.size === 0) throw new Error(`Image is empty: ${path}`);
   if (stat.size > MAX_IMAGE_BYTES) {
     const mb = (stat.size / (1024 * 1024)).toFixed(1);
-    throw new Error(`Image is too large (${mb} MB); Google Lens accepts up to ${MAX_IMAGE_BYTES / (1024 * 1024)} MB`);
+    throw new Error(`Image is too large (${mb} MB). Google Lens accepts up to ${MAX_IMAGE_BYTES / (1024 * 1024)} MB`);
   }
 
   const head = Buffer.alloc(16);
@@ -2026,11 +2172,11 @@ export async function visitPage(
     }
     return extractVia(url, status, "Using Defuddle for clean article extraction...",
       bundle + "\n;" + DEFUDDLE_DRIVER_JS,
-      { clickConsent: true, fallbackJs: EXTRACT_PAGE_JS, safetyExtract: true, contentFirst: true });
+      { clickConsent: true, fallbackJs: EXTRACT_PAGE_JS, safetyExtract: true, contentFirst: true, wallRecheck: true });
   }
 
   return extractVia(url, status, "", EXTRACT_PAGE_JS,
-    { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true, safetyExtract: true, contentFirst: true });
+    { clickConsent: true, dynamicScroll: true, initialWaitMs: 0, bringToFront: true, safetyExtract: true, contentFirst: true, wallRecheck: true });
 }
 
 // Exported for testing - internal API, not part of the extension's tool surface
@@ -2041,6 +2187,7 @@ export {
   type CDPLike,
   type RunInPageOptions,
   runInPageSession,
+  waitForShortPageGrowth,
 };
 export {
   isXUrl,

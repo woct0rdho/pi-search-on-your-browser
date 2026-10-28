@@ -73,6 +73,10 @@ class FakeCDP implements CDPLike {
   settleStates: string[] = [];
   // Every pi-settle probe response the session saw.
   settleProbes: string[] = [];
+  // waitForShortPageGrowth() probes (marked pi-short-page). Queued responses.
+  // The default is a long page, so the watch is a no-op unless a test sets it.
+  shortPageStates: string[] = [];
+  shortPageProbes: string[] = [];
   // Queued WALL_PROBE_JS responses (JSON). Shifted per call. The default is a
   // normal content page.
   wallStates: string[] = [];
@@ -164,6 +168,14 @@ class FakeCDP implements CDPLike {
 
   async evaluate(expression: string): Promise<string> {
     this.evaluations.push(expression);
+    // waitForShortPageGrowth's probe (marked so the fake can tell it apart
+    // from the settle probe above).
+    if (expression.includes("/* pi-short-page */")) {
+      const state =
+        this.shortPageStates.shift() ?? "body|complete|1000|https://example.com/page";
+      this.shortPageProbes.push(state);
+      return state;
+    }
     // waitForSettledDocument's probe (marked so the fake can find it).
     if (expression.includes("/* pi-settle */")) {
       const state = this.settleStates.shift() ?? "body|complete|1000|https://example.com/page";
@@ -321,7 +333,7 @@ test("extraction runs the provided JS and returns the evaluated result", async (
   }));
 
   assert.equal(result, "## Extracted\n\nSome content");
-  assert.equal(fake.evaluations.at(-1), "myExtractor()");
+  assert.ok(fake.evaluations.includes("myExtractor()"), "the extractor runs");
 });
 
 test("dynamicScroll issues scroll evaluations", async () => {
@@ -1084,6 +1096,80 @@ const WALL_CONTENT = JSON.stringify({
   captcha: false,
   password: false,
   scripts: 3,
+});
+
+test("a bot check that paints after the settle probe is not returned as content", async () => {
+  const fake = new FakeCDP();
+  // Probed before the check painted. The extractor then read the check page.
+  // The re-check sees the challenge and the wait ends on the real page.
+  fake.wallStates = [WALL_CONTENT, WALL_CHALLENGE, WALL_CONTENT];
+  fake.extractionQueue = [
+    "Automated bot check in progress. This should only take a few seconds.".padEnd(120, " "),
+    "REAL CONTENT: ".padEnd(120, "r"),
+  ];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 2_000 }));
+
+  assert.ok(result.startsWith("REAL CONTENT:"), `expected the page after the check, got: ${result}`);
+});
+
+test("a gate that never clears is reported, not returned as content", async () => {
+  const fake = new FakeCDP();
+  fake.wallStates = [WALL_CONTENT, WALL_CHALLENGE];
+  fake.extractionQueue = ["Verify you are human. ".padEnd(80, " ")];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 500 }));
+
+  assert.match(result, /^__BLOCKED__: challenge: /, `expected a blocked marker, got: ${result}`);
+});
+
+test("an interactive slider gate fails at once instead of waiting", async () => {
+  const fake = new FakeCDP();
+  // No slide wording in the text and no telling title: only the vendor script
+  // (Din, cstaticdun.126.net) identifies this as a gate.
+  fake.wallStates = [
+    JSON.stringify({
+      href: "https://example.com/page",
+      title: "",
+      len: 110,
+      head: "请确认您不是机器人 您当前未登录，每次访问该类帖子都需要验证",
+      captcha: false,
+      password: false,
+      scripts: 3,
+      images: 12,
+      gate: "captcha",
+    }),
+  ];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()", wallWaitMs: 5_000 }));
+
+  assert.match(result, /^__BLOCKED__: captcha: /, `expected a captcha marker, got: ${result}`);
+  assert.equal(
+    fake.evaluations.filter((e) => e === "extractor()").length,
+    0,
+    "an unsolvable gate must not be waited out",
+  );
+});
+
+test("a nav-only result is retried once the body renders", async () => {
+  const fake = new FakeCDP();
+  const nav = Array.from({ length: 14 }, (_, i) => `- [Link ${i}](https://example.com/${i})`).join("\n");
+  fake.extractionQueue = [nav, "REAL ARTICLE: ".padEnd(200, "a")];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.ok(result.startsWith("REAL ARTICLE:"), `expected the body on the second pass, got: ${result}`);
+  assert.equal(fake.evaluations.filter((e) => e === "extractor()").length, 2, "extracted twice");
+});
+
+test("a nav-only result that stays thin is kept as it was", async () => {
+  const fake = new FakeCDP();
+  const nav = Array.from({ length: 14 }, (_, i) => `- [Link ${i}](https://example.com/${i})`).join("\n");
+  fake.extractionQueue = [nav, "- [Other](https://example.com/other)"];
+
+  const result = await runInPageSession(fake, baseOpts({ js: "extractor()" }));
+
+  assert.equal(result, nav, "the richer copy wins");
 });
 
 test("a 200 bot-check page is waited out and then extracted", async () => {

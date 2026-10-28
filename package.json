@@ -3,7 +3,7 @@
   "version": "0.9.0",
   "description": "Search Google and read X (Twitter), Reddit, Amazon, and Google Scholar in your own visible Chrome - same approach as @antirez's ds4-agent. No API keys.",
   "type": "module",
-  "packageManager": "pnpm@12.8.1",
+  "packageManager": "pnpm",
   "scripts": {
     "test": "node --experimental-strip-types --test tests/unit/*.test.ts",
     "typecheck": "tsc --noEmit"
@@ -27,7 +27,6 @@
     "markdown",
     "reader-mode"
   ],
-  "author": "xezpeleta",
   "license": "MIT",
   "engines": {
     "node": ">=22.19.0"

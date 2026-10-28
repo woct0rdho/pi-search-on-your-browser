@@ -516,8 +516,8 @@ export function defuddleBundlePath(): string {
     return requireFromHere.resolve("defuddle/full");
   } catch {
     throw new Error(
-      "The 'defuddle' package is not installed - run `pnpm install` (or `npm install`). " +
-        "Clean extraction needs it; without it, visit_page({ clean: true }) falls back to the generic extractor.",
+      "The 'defuddle' package is not installed. Run `pnpm install` (or `npm install`). " +
+        "Clean extraction needs it. Without it, visit_page({ clean: true }) falls back to the generic extractor.",
     );
   }
 }
@@ -1051,6 +1051,9 @@ export interface WallState {
   scripts: number;
   // Number of <img> elements: an image-only page has no text but is content. *
   images: number;
+  // Kind of gate identified from the scripts/frames the page loaded ("" when
+  // none). See GATE_INFRA.
+  gate?: string;
 }
 
 export type WallKind = "challenge" | "captcha" | "login" | "shell";
@@ -1060,9 +1063,48 @@ export type WallKind = "challenge" | "captcha" | "login" | "shell";
 const WALL_TITLE_RE =
   /^(just a moment|client challenge|attention required|access denied|checking your browser|verifying your browser|please wait|请稍候|人机验证|安全验证|环境异常|アクセスが制限)/i;
 
-// Body text that only appears on bot-check interstitials.
+// Body text that only appears on bot-check interstitials. Deliberately narrow:
+// generic wording ("captcha", "security check", "human verification",
+// "你是真人吗") also occurs inside articles about CAPTCHAs, so it is left out
+// entirely. This list is the fast path for the big vendors, not the only
+// defence: a short page that is still rewriting itself is waited out too (see
+// waitForShortPageGrowth in chrome.ts), which is what covers vendor wording
+// nobody has seen before.
 const WALL_BODY_RE =
-  /client challenge|checking your browser|verifying your browser|checking if the site connection is secure|enable javascript and cookies|ddos protection|verify (?:you are|you're) (?:a )?human|are you a robot|human verification|请稍候|人机验证|安全验证|环境异常|しばらくお待ちください|アクセスが制限/i;
+  /client challenge|checking your browser|verifying your browser|verifying (?:that )?you are (?:a )?human|checking if the site connection is secure|enable javascript and cookies|ddos protection|pardon our interruption|access to this page has been denied|request unsuccessful|please wait while we verify|please complete the security check|请稍候|人机验证|安全验证|环境异常|しばらくお待ちください|アクセスが制限/i;
+
+// Slider and press-and-hold widgets. They are interactive by design and never
+// clear on their own, so they are reported as a CAPTCHA (a gate a person has
+// to solve) instead of being waited out.
+const WALL_SLIDER_RE =
+  /drag[^.]{0,30}(?:slider|puzzle)|press (?:and|&) hold|滑动[^。]{0,12}(?:滑块|拼图)|拖动[^。]{0,12}(?:滑块|拼图)|滑块验证|スライダーをドラッグ|드래그/i;
+
+// Scripts and frames that only a gate page loads. Widget embeds are absent on
+// purpose: challenges.cloudflare.com/turnstile, hCaptcha and reCAPTCHA render
+// inside ordinary forms (nowsecure.nl), and Cloudflare injects its
+// challenge-platform/scripts/jsd detector into normal pages too.
+const GATE_INFRA: ReadonlyArray<{ kind: WallKind; re: RegExp }> = [
+  { kind: "challenge", re: /\/cdn-cgi\/challenge-platform\/[^"']*orchestrate\/chl_page/ },
+  { kind: "challenge", re: /\/_fs-ch-/ }, // Fastly "Client Challenge"
+  { kind: "challenge", re: /captcha-delivery\.com/ }, // DataDome
+  { kind: "challenge", re: /_incapsula_resource/ }, // Imperva
+  { kind: "challenge", re: /check\.ddos-guard\.net/ },
+  { kind: "captcha", re: /cstaticdun\.126\.net|dun\.163\.com/ }, // Din slider
+  { kind: "captcha", re: /captcha\.px-cdn\.net/ }, // PerimeterX press-and-hold
+];
+
+// The gate kind implied by a page's script/frame sources, or "". The probe
+// below builds its detector from the same table, so this stays the single
+// source of truth (and stays testable).
+export function gateFromSources(sources: readonly string[]): string {
+  for (const src of sources) {
+    const s = src.toLowerCase();
+    for (const { kind, re } of GATE_INFRA) {
+      if (re.test(s)) return kind;
+    }
+  }
+  return "";
+}
 
 // "Still loading" placeholders of JavaScript app shells.
 const WALL_LOADING_RE =
@@ -1082,12 +1124,19 @@ const WALL_CAPTCHA_TEXT_RE =
 // `password` means a *laid-out* password field (the probe checks it), because
 // plenty of pages carry a hidden login modal in their header.
 export function classifyWall(state: WallState): WallKind | null {
+  // A slider or press-and-hold gate is never going to clear by waiting.
+  if (state.len < 800 && state.gate === "captcha") return "captcha";
+  if (state.len < 240 && WALL_SLIDER_RE.test(state.head)) return "captcha";
   if (state.captcha && state.len < 800 && WALL_CAPTCHA_TEXT_RE.test(`${state.title} ${state.head}`)) {
     return "captcha";
   }
   if (state.len < 500 && (WALL_TITLE_RE.test(state.title.trim()) || WALL_BODY_RE.test(state.head))) {
     return "challenge";
   }
+  // Gate infrastructure on a page that has not rendered its content yet: a
+  // challenge document that replaced the page after the settle probe, before
+  // any of its wording was on screen (seen with sites that run their own check).
+  if (state.len < 500 && state.gate === "challenge") return "challenge";
   if (state.len <= 240 && WALL_LOADING_RE.test(state.head)) return "shell";
   // No text at all and no images, but scripts: a shell that has not rendered.
   // An image-only page (a gallery) is content, not a shell.
@@ -1097,7 +1146,10 @@ export function classifyWall(state: WallState): WallKind | null {
 }
 
 // One-shot page state probe used by classifyWall(). The `pi-wall` marker
-// lets the unit-test fake recognise the probe.
+// lets the unit-test fake recognise the probe. The gate detector below is
+// generated from GATE_INFRA, so the vendor list lives in one place.
+const GATE_INFRA_LITERAL = JSON.stringify(GATE_INFRA.map(({ kind, re }) => [kind, re.source]));
+
 export const WALL_PROBE_JS = `(() => {
   /* pi-wall */
   try {
@@ -1106,6 +1158,15 @@ export const WALL_PROBE_JS = `(() => {
     const has = s => { try { return Boolean(document.querySelector(s)); } catch (e) { return false; } };
     const pw = document.querySelector("input[type=password]");
     const pwVisible = Boolean(pw && (pw.getClientRects().length > 0 || pw.offsetParent !== null));
+    const gateList = ${GATE_INFRA_LITERAL};
+    let gate = "";
+    for (const tag of document.querySelectorAll("script[src],iframe[src],link[href]")) {
+      const u = (tag.getAttribute("src") || tag.getAttribute("href") || "").toLowerCase();
+      for (const g of gateList) {
+        if (new RegExp(g[1]).test(u)) { gate = g[0]; break; }
+      }
+      if (gate) break;
+    }
     return JSON.stringify({
       href: location.href,
       title: (document.title || "").trim(),
@@ -1114,7 +1175,8 @@ export const WALL_PROBE_JS = `(() => {
       captcha: has(".g-recaptcha,[data-sitekey],.cf-turnstile,.h-captcha,iframe[src*='recaptcha'],iframe[src*='hcaptcha']"),
       password: pwVisible,
       scripts: document.scripts.length,
-      images: document.images.length
+      images: document.images.length,
+      gate: gate
     });
   } catch (e) {
     return JSON.stringify({ error: String((e && e.message) || e) });
@@ -1146,6 +1208,24 @@ export const WIDGET_RECTS_JS = `(() => {
   }
   return JSON.stringify(out);
 })()`;
+
+// How much prose an extraction produced, ignoring link targets, URLs and
+// Markdown punctuation. Used to tell "the article" from "the site's chrome":
+// a Wayback snapshot or a slow SPA can render its navigation first.
+export function markdownProseLength(markdown: string): number {
+  return markdown
+    .replace(/\[[^\]]*\]\([^)]*\)/g, (link) => link.slice(1, link.indexOf("]")))
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[#>*`\-\s]+/g, "")
+    .length;
+}
+
+// True when a result is mostly a list of links with little prose - the shape of
+// a shell, a nav-only snapshot, or a page whose body failed to render.
+export function looksNavOnly(markdown: string): boolean {
+  const links = (markdown.match(/\]\(/g) ?? []).length;
+  return links >= 12 && markdownProseLength(markdown) < 400;
+}
 
 // Read a URL that Chrome turned into a download. Runs on a page of the same
 // origin (about:blank has an opaque origin, so fetch() from there is

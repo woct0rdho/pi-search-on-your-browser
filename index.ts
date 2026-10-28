@@ -268,7 +268,7 @@ function visitPageToolDefinition() {
             {
               type: "text" as const,
               text:
-                `Navigation failed for ${result.url} - the browser could not load the page ` +
+                `Navigation failed for ${result.url} . The browser could not load the page ` +
                 `(DNS, proxy, TLS, or the site redirected the tab to an error page). ` +
                 `The URL may be unreachable from this network, or the page may have moved.`,
             },
@@ -283,28 +283,30 @@ function visitPageToolDefinition() {
       // not text. Say what it is so the model does not treat it as the page.
       if (result.blocked) {
         const { kind, detail } = result.blocked;
+        // These are failures, not instructions. A gate that needs a person
+        // (CAPTCHA, slider, login) stays an error: the agent runs unattended,
+        // so "solve this in the window" is not an action it can take.
+        // Delegating interactive gates to a general browser-use tool is
+        // possible later. Until then they are reported as inaccessible.
         let text: string;
         if (kind === "challenge") {
           text =
-            `The site answered ${result.url} with a bot check instead of the page (${detail}), and it did not clear. ` +
-            `The tool's Chrome window is visible - open that URL there, let the check finish, then retry. ` +
-            `The clearance is stored in the browser profile.`;
+            `The site answered ${result.url} with a bot check instead of the page (${detail}), ` +
+            `and it did not clear after waiting. The page content is not reachable from this tool.`;
         } else if (kind === "captcha") {
           text =
-            `A CAPTCHA gates ${result.url} (${detail}). It cannot be solved automatically - ` +
-            `open the URL in the visible Chrome window, solve it there, then retry.`;
+            `${result.url} is gated by an interactive check (${detail}), which this tool does not ` +
+            `perform. The page content is not reachable from this tool.`;
         } else if (kind === "login") {
-          text =
-            `${result.url} requires a login (${detail}). Sign in in the visible Chrome window, ` +
-            `then retry - the session stays in the browser profile.`;
+          text = `${result.url} requires a login (${detail}). The page content is not reachable from this tool.`;
         } else if (kind === "shell") {
           text =
             `The page at ${result.url} rendered no readable text (${detail}) even after waiting. ` +
-            `It is a JavaScript app that did not hydrate; retry once, or use a general browser-use tool for interactive pages.`;
+            `It is a JavaScript app that did not hydrate. Retrying once may work.`;
         } else if (kind === "download") {
           text =
             `${result.url} is a file download, not a web page (${detail}). ` +
-            `It cannot be returned as page Markdown - download the file instead.`;
+            `It cannot be returned as page Markdown. Download the file instead.`;
         } else {
           text = `The page could not be read (${kind}: ${detail}).`;
         }
@@ -324,14 +326,14 @@ function visitPageToolDefinition() {
         const reason = result.httpStatusText || "";
         let hint: string;
         if (code === 404) {
-          hint = "The page does not exist at this URL - the content may have been moved, removed, or the URL may be incorrect. Try a different URL or search for the content.";
+          hint = "The page does not exist at this URL. The content may have been moved, removed, or the URL may be incorrect. Try a different URL or search for the content.";
         } else if (code === 403) {
           const isChallenge = /challenge|bot|captcha|cloudflare|datadome|perimeterx|incapsula/i.test(reason);
           hint = isChallenge
-            ? "The site served a bot check that did not clear automatically. The tool's Chrome window is visible - open or refresh this URL there (click the check if one appears), then retry. The clearance is stored in the browser profile."
-            : "Access was denied - the site may be blocking automated access, require authentication, or be behind a paywall. The tool's Chrome window is visible: open this URL there to log in or clear any check, then retry.";
+            ? "The site served a bot check that did not clear automatically. The page content is not reachable from this tool."
+            : "Access was denied. The site may be blocking automated access, require authentication, or be behind a paywall.";
         } else if (code === 429) {
-          hint = "Rate limited - too many requests. Wait a moment and retry.";
+          hint = "Rate limited. Too many requests. Wait a moment and retry.";
         } else if (code >= 500) {
           hint = "The server had an error. Retry shortly, or try a different URL.";
         } else {
